@@ -1798,7 +1798,14 @@ ENSEMBLE_W                = 0.5
 PRIOR_LAMBDA              = 0.4
 APPLY_THRESHOLD_TRANSFORM = True
 
-_PHASE4_W = {1: (0.70, 0.30), 2: (0.75, 0.25), 3: (0.65, 0.35), 4: (0.80, 0.20)}
+_PHASE4_W = {
+    1: (0.70, 0.30),   # less SED
+    2: (0.75, 0.25),   # much less SED
+    3: (0.65, 0.35),   # slightly less SED than Phase 2
+    4: (0.80, 0.20),   # very little SED
+    5: (0.55, 0.45),   # slightly more SED than Phase 2
+    6: (0.50, 0.50),   # equal weight
+}
 PW, SW = _PHASE4_W[PHASE4_TRIAL] if CURRENT_PHASE == 4 else (0.60, 0.40)
 
 _EXP_META = {
