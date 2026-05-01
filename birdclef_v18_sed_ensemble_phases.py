@@ -2065,22 +2065,51 @@ def rank_average_blend(champ_p, sed_p, pw, sw):
     return np.clip(out, 0.0, 1.0)
 
 
-# SED model paths — configure these to match your Kaggle input datasets
-_SED_ROOT    = Path("/kaggle/input/birdclef-2026-sed-models")
-SED_B0B3_PATHS = [
-    _SED_ROOT / "efficientnet_b0_fold0.onnx",
-    _SED_ROOT / "efficientnet_b0_fold1.onnx",
-    _SED_ROOT / "efficientnet_b3_fold0.onnx",
+# ── SED model path auto-discovery ─────────────────────────────────────
+def _find_onnx(filename, search_root=Path("/kaggle/input")):
+    """Recursively find an ONNX file by name under search_root."""
+    hits = list(search_root.rglob(filename))
+    if not hits:
+        return None
+    return sorted(hits, key=lambda p: len(p.parts))[0]   # shortest path wins
+
+def _resolve_sed_paths(filenames):
+    """Resolve a list of ONNX filenames to full paths, report misses."""
+    resolved, missing = [], []
+    for fn in filenames:
+        p = _find_onnx(fn)
+        if p is not None:
+            print(f"  found  {fn}  →  {p}")
+            resolved.append(p)
+        else:
+            print(f"  MISSING {fn}")
+            missing.append(fn)
+    if missing:
+        # List every .onnx visible in /kaggle/input to help the user
+        all_onnx = sorted(Path("/kaggle/input").rglob("*.onnx"))
+        print(f"\nAll .onnx files visible in /kaggle/input ({len(all_onnx)} total):")
+        for p in all_onnx[:40]:
+            print(f"  {p}")
+        raise FileNotFoundError(
+            f"Missing SED models: {missing}\n"
+            "Mount the dataset that contains these files as a Kaggle input."
+        )
+    return resolved
+
+_SED_B0B3_NAMES = [
+    "efficientnet_b0_fold0.onnx",
+    "efficientnet_b0_fold1.onnx",
+    "efficientnet_b3_fold0.onnx",
 ]
-SED_V5_PATHS = [
-    _SED_ROOT / "v5_focal.onnx",
-    _SED_ROOT / "ce_s123.onnx",
-    _SED_ROOT / "ce_s456.onnx",
-    _SED_ROOT / "v5_pseudo.onnx",
-    _SED_ROOT / "v5_pseudo2.onnx",
-    _SED_ROOT / "v5_external.onnx",
-    _SED_ROOT / "v5_external_s91.onnx",
-    _SED_ROOT / "v5_external_s92.onnx",
+_SED_V5_NAMES = [
+    "v5_focal.onnx",
+    "ce_s123.onnx",
+    "ce_s456.onnx",
+    "v5_pseudo.onnx",
+    "v5_pseudo2.onnx",
+    "v5_external.onnx",
+    "v5_external_s91.onnx",
+    "v5_external_s92.onnx",
 ]
 
 # ──────────────────────────────────────────────────────────────────────
@@ -2100,11 +2129,12 @@ elif CURRENT_PHASE == 1:
     mirror_applied = True
 
 elif CURRENT_PHASE in (2, 3, 4):
-    paths_to_load = list(SED_B0B3_PATHS)
+    names_to_load = list(_SED_B0B3_NAMES)
     if CURRENT_PHASE in (3, 4):
-        paths_to_load += list(SED_V5_PATHS)
+        names_to_load += list(_SED_V5_NAMES)
 
-    print(f"[Phase {CURRENT_PHASE}] Loading {len(paths_to_load)} SED models...")
+    print(f"[Phase {CURRENT_PHASE}] Discovering {len(names_to_load)} SED models...")
+    paths_to_load   = _resolve_sed_paths(names_to_load)
     sed_sessions    = _load_onnx_sessions(paths_to_load)
     sed_model_count = len(sed_sessions)
 
