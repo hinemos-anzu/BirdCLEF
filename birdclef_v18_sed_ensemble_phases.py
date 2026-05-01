@@ -1799,15 +1799,15 @@ PRIOR_LAMBDA              = 0.4
 APPLY_THRESHOLD_TRANSFORM = True
 
 _PHASE4_W = {1: (0.70, 0.30), 2: (0.75, 0.25), 3: (0.65, 0.35), 4: (0.80, 0.20)}
-PW, SW = _PHASE4_W[PHASE4_TRIAL] if CURRENT_PHASE == 4 else (0.70, 0.30)
+PW, SW = _PHASE4_W[PHASE4_TRIAL] if CURRENT_PHASE == 4 else (0.60, 0.40)
 
 _EXP_META = {
-    0: ("champion_reproduce_0931",     "none",                     "N/A",       "N/A"),
-    1: ("exp_mirror_only",             "mirror_correction",        "OFF",       "ON"),
-    2: ("exp_sed_b0b3_rank_mirror",    "SED_B0B3+rank_avg",        "OFF",       f"PW={PW},SW={SW}"),
-    3: ("exp_sed_v5_rank_mirror",      "SED_B0B3+v5_ONNX+rank_avg","B0B3_only", f"all+PW={PW},SW={SW}"),
-    4: (f"exp_sed_v5_rank_mirror_pw{int(PW*100):03d}_sw{int(SW*100):03d}",
-        "PW/SW", "0.70/0.30", f"{PW}/{SW}"),
+    0: ("champion_reproduce_0931",          "none",                        "N/A",       "N/A"),
+    1: ("exp_mirror_only",                  "mirror_correction",           "OFF",       "ON"),
+    2: ("exp_tucker_sed_rank_mirror",       "Tucker_SED_5fold+rank_avg",   "OFF",       f"PW={PW},SW={SW}"),
+    3: ("exp_tucker_sed_all_rank_mirror",   "Tucker+v5_ONNX+rank_avg",     "5fold_only",f"all+PW={PW},SW={SW}"),
+    4: (f"exp_tucker_sed_pw{int(PW*100):03d}_sw{int(SW*100):03d}",
+        "PW/SW", "0.60/0.40", f"{PW}/{SW}"),
 }
 EXP_NAME, _CHG_VAR, _PREV_VAL, _NEW_VAL = _EXP_META[CURRENT_PHASE]
 AUDIT_PATH = Path("/kaggle/working") / f"submission_{EXP_NAME}.csv"
@@ -2006,41 +2006,45 @@ def _load_onnx_sessions(path_list, label="SED"):
     return sessions
 
 
-def _segment_to_mel(y_seg, sr=32000, n_fft=1024, hop=320,
-                    n_mels=128, fmin=20, fmax=16000):
-    import torchaudio.transforms as _TT
-    wav    = torch.tensor(y_seg, dtype=torch.float32)
-    mel    = _TT.MelSpectrogram(sample_rate=sr, n_fft=n_fft, hop_length=hop,
-                                 n_mels=n_mels, f_min=fmin, f_max=fmax)(wav)
-    mel_db = _TT.AmplitudeToDB(stype="amplitude", top_db=80)(mel)
-    return mel_db.numpy()   # (n_mels, T)
+def _segment_to_mel_tucker(y_seg, sr=32000):
+    """Tucker Arrants SED mel-spec: librosa, N_MELS=256, N_FFT=2048, HOP=512, gaussian σ=0.65."""
+    import librosa
+    from scipy.ndimage import gaussian_filter1d as _gf1d
+    mel    = librosa.feature.melspectrogram(
+                y=y_seg.astype(np.float32), sr=sr,
+                n_fft=2048, hop_length=512, n_mels=256)
+    mel_db = librosa.power_to_db(mel, ref=np.max)
+    mel_db = (mel_db - mel_db.mean()) / (mel_db.std() + 1e-6)
+    return _gf1d(mel_db, sigma=0.65, axis=-1)   # (256, T)
 
 
-def _infer_one_window(mel, sessions):
+def _infer_tucker_window(mel, sessions):
+    """Tucker SED two-output inference: 0.5*sigmoid(clip) + 0.5*sigmoid(frame_max)."""
     preds = []
     for sess in sessions:
-        inp_name  = sess.get_inputs()[0].name
-        n_in_dims = len(sess.get_inputs()[0].shape)
-        x_in = (mel[None, None, :, :] if n_in_dims == 4 else
-                mel[None, :, :]       if n_in_dims == 3 else
-                mel.flatten()[None, :])
-        exp_t = sess.get_inputs()[0].shape[-1]
-        if isinstance(exp_t, int):
-            t = x_in.shape[-1]
-            if t < exp_t:
-                x_in = np.pad(x_in, [(0, 0)] * (x_in.ndim - 1) + [(0, exp_t - t)])
-            elif t > exp_t:
-                x_in = x_in[..., :exp_t]
-        out = sess.run(None, {inp_name: x_in.astype(np.float32)})[0].squeeze()
-        if out.ndim == 0:
-            out = np.full(N_CLASSES, float(out))
-        if len(out) > N_CLASSES:
-            out = out[:N_CLASSES]
-        elif len(out) < N_CLASSES:
-            out = np.pad(out, (0, N_CLASSES - len(out)))
-        if out.max() > 1.0 or out.min() < 0.0:
-            out = sigmoid(out)
-        preds.append(out.astype(np.float32))
+        inp_name = sess.get_inputs()[0].name
+        x_in     = mel[np.newaxis, np.newaxis, :, :].astype(np.float32)  # (1,1,256,T)
+        outputs  = sess.run(None, {inp_name: x_in})
+
+        clip_logits = np.array(outputs[0]).squeeze()   # (n_classes,)
+        if len(outputs) >= 2:
+            frame_logits = np.array(outputs[1]).squeeze()   # (T, n_classes) or (n_classes, T)
+            if frame_logits.ndim == 2:
+                # Determine time axis: smaller dim is n_classes
+                frame_max = (frame_logits.max(axis=1)
+                             if frame_logits.shape[0] == N_CLASSES
+                             else frame_logits.max(axis=0))
+            else:
+                frame_max = frame_logits
+            p = 0.5 * sigmoid(clip_logits) + 0.5 * sigmoid(frame_max)
+        else:
+            p = sigmoid(clip_logits)
+
+        if len(p) > N_CLASSES:
+            p = p[:N_CLASSES]
+        elif len(p) < N_CLASSES:
+            p = np.pad(p, (0, N_CLASSES - len(p)))
+        preds.append(p.astype(np.float32))
     return np.mean(preds, axis=0)
 
 
@@ -2054,8 +2058,8 @@ def run_sed_inference(audio_paths, sessions):
         y = np.pad(y, (0, max(0, target - len(y))))[:target]
         for wi in range(N_WINDOWS):
             seg = y[wi * WINDOW_SAMPLES:(wi + 1) * WINDOW_SAMPLES]
-            mel = _segment_to_mel(seg)
-            all_probs.append(_infer_one_window(mel, sessions))
+            mel = _segment_to_mel_tucker(seg)
+            all_probs.append(_infer_tucker_window(mel, sessions))
     return np.array(all_probs, dtype=np.float32)   # (n_files*N_WINDOWS, N_CLASSES)
 
 
@@ -2102,9 +2106,11 @@ def _resolve_sed_paths(filenames):
     return resolved
 
 _SED_B0B3_NAMES = [
-    "efficientnet_b0_fold0.onnx",
-    "efficientnet_b0_fold1.onnx",
-    "efficientnet_b3_fold0.onnx",
+    "sed_fold0.onnx",
+    "sed_fold1.onnx",
+    "sed_fold2.onnx",
+    "sed_fold3.onnx",
+    "sed_fold4.onnx",
 ]
 _SED_V5_NAMES = [
     "v5_focal.onnx",
