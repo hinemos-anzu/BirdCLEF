@@ -2081,9 +2081,9 @@ if IS_DRY_RUN:
     _b_dr = pd.read_csv("submission_sed.csv")
     _cols_dr = [c for c in _a_dr.columns if c != "row_id"]
 
-    # dry-runファイルのY_trueをsc DataFrameから復元
-    _rid2y = sc.set_index("row_id")[PRIMARY_LABELS].to_dict("index")
-    _common = [r for r in _a_dr["row_id"].tolist() if r in _rid2y]
+    # dry-runファイルのY_trueをY_SC配列から復元（scにはPRIMARY_LABELS列がない）
+    _rid2idx = {r: i for i, r in enumerate(sc["row_id"].tolist())}
+    _common  = [r for r in _a_dr["row_id"].tolist() if r in _rid2idx]
 
     if len(_common) >= N_WINDOWS:
         _idx  = _a_dr["row_id"].isin(_common)
@@ -2091,11 +2091,9 @@ if IS_DRY_RUN:
 
         _pa_dr = np.clip(_a_dr.loc[_idx, _cols_dr].to_numpy(np.float32), 1e-5, 1 - 1e-5)
         _pb_dr = np.clip(_b_dr.loc[_idx, _cols_dr].to_numpy(np.float32), 1e-5, 1 - 1e-5)
-        _Y_dr  = np.array(
-            [[_rid2y[r][c] for c in _cols_dr]
-             for r in _a_dr.loc[_idx, "row_id"]],
-            dtype=np.float32
-        )
+        _Y_dr  = Y_SC[
+            [_rid2idx[r] for r in _a_dr.loc[_idx, "row_id"]]
+        ].astype(np.float32)
 
         def _logit_blend_auc(pa, pb, sed_w, Y):
             la = np.log(pa / (1.0 - pa))
@@ -2116,7 +2114,7 @@ if IS_DRY_RUN:
         _delta = _g_results[OPTIMAL_SED_W] - _g_results.get(DEFAULT_SED_W, 0.0)
         print(f"\n最適 SED_W = {OPTIMAL_SED_W}  (AUC={_g_results[OPTIMAL_SED_W]:.6f})")
         print(f"Δ vs default ({DEFAULT_SED_W}): {_delta:+.6f}")
-        del _a_dr, _b_dr, _pa_dr, _pb_dr, _Y_dr, _rid2y
+        del _a_dr, _b_dr, _pa_dr, _pb_dr, _Y_dr, _rid2idx
     else:
         OPTIMAL_SED_W = DEFAULT_SED_W
         print(f"Y_true行数不足 ({len(_common)}) — デフォルト SED_W={DEFAULT_SED_W} を使用")
