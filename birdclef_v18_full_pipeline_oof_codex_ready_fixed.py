@@ -1768,8 +1768,9 @@ if CFG["run_oof"]:
 
 # ── Cell 9: Test inference ─────────────────────────────────────────────
 test_paths = sorted((BASE / "test_soundscapes").glob("*.ogg"))
- 
-if not test_paths:
+IS_DRY_RUN = len(test_paths) == 0
+
+if IS_DRY_RUN:
     n = CFG["dryrun_n_files"] or 20
     print(f"No hidden test — dry-run on {n} train files")
     test_paths = sorted((BASE / "train_soundscapes").glob("*.ogg"))[:n]
@@ -1951,10 +1952,395 @@ sub.insert(0, "row_id", meta_te["row_id"].values)
 assert list(sub.columns) == ["row_id"] + PRIMARY_LABELS
 assert len(sub) == len(test_paths) * N_WINDOWS
 assert not sub.isna().any().any()
-sub.to_csv("submission.csv", index=False)
+sub.to_csv("submission_protossm.csv", index=False)
+protossm_sub = sub.copy()
 
-print(f"\nsubmission.csv saved — shape {sub.shape}")
+print(f"\nsubmission_protossm.csv saved — shape {sub.shape}")
 print(f"Total wall time: {(time.time() - _WALL_START)/60:.1f} min")
 
- 
- 
+del emb_tr_f, sc_tr_f, proto_model, res_model
+gc.collect()
+print("Memory freed. Ready for SED cell.")
+# ── Cell 11: Tucker Arrants distilled SED ONNX inference ──────────────
+
+import librosa
+from scipy.ndimage import gaussian_filter1d
+
+N_MELS_SED = 256
+N_FFT_SED  = 2048
+HOP_SED    = 512
+FMIN_SED   = 20
+FMAX_SED   = 16000
+TOP_DB_SED = 80
+
+
+def find_sed_dir():
+    hits = sorted(Path("/kaggle/input").rglob("sed_fold0.onnx"))
+    if not hits:
+        raise FileNotFoundError(
+            "sed_fold0.onnx not found. "
+            "Attach tuckerarrants/bc2026-distilled-sed-public to this notebook."
+        )
+    return hits[0].parent
+
+
+def make_sed_session(path):
+    so = ort.SessionOptions()
+    so.intra_op_num_threads = 4
+    so.inter_op_num_threads = 1
+    so.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
+    return ort.InferenceSession(
+        str(path),
+        sess_options=so,
+        providers=["CPUExecutionProvider"]
+    )
+
+
+def audio_to_mel(chunks):
+    mels = []
+    for x in chunks:
+        s = librosa.feature.melspectrogram(
+            y=x, sr=SR, n_fft=N_FFT_SED, hop_length=HOP_SED,
+            n_mels=N_MELS_SED, fmin=FMIN_SED, fmax=FMAX_SED, power=2.0,
+        )
+        s = librosa.power_to_db(s, top_db=TOP_DB_SED)
+        s = (s - s.mean()) / (s.std() + 1e-6)
+        mels.append(s)
+    return np.stack(mels)[:, None].astype(np.float32)
+
+
+def file_to_sed_chunks(path):
+    y, sr0 = sf.read(str(path), dtype="float32", always_2d=False)
+    if y.ndim == 2:
+        y = y.mean(axis=1)
+    if sr0 != SR:
+        y = librosa.resample(y, orig_sr=sr0, target_sr=SR)
+    n = 60 * SR
+    if len(y) < n:
+        y = np.pad(y, (0, n - len(y)))
+    else:
+        y = y[:n]
+    chunks = y.reshape(N_WINDOWS, WINDOW_SAMPLES)
+    ends   = np.arange(1, N_WINDOWS + 1) * WINDOW_SEC
+    return chunks, ends
+
+
+def sigmoid_sed(x):
+    return (1.0 / (1.0 + np.exp(-np.clip(x, -50, 50)))).astype(np.float32)
+
+
+sed_dir = find_sed_dir()
+sed_fold_paths = sorted(
+    sed_dir.glob("sed_fold*.onnx"),
+    key=lambda p: int(re.search(r"sed_fold(\d+)", p.name).group(1))
+)
+sed_sessions = [make_sed_session(p) for p in sed_fold_paths]
+
+print(f"SED dir: {sed_dir}")
+print(f"SED folds loaded: {[p.name for p in sed_fold_paths]}")
+
+sed_rows, sed_preds = [], []
+_t0_sed = time.time()
+
+for i, path in enumerate(test_paths, 1):
+    chunks, ends = file_to_sed_chunks(path)
+    mel = audio_to_mel(chunks)
+
+    p_sum = np.zeros((len(chunks), N_CLASSES), dtype=np.float32)
+    for sess in sed_sessions:
+        outs        = sess.run(None, {sess.get_inputs()[0].name: mel})
+        clip_logits = outs[0]
+        frame_max   = outs[1].max(axis=1)
+        p_sum += 0.5 * sigmoid_sed(clip_logits) + 0.5 * sigmoid_sed(frame_max)
+
+    p_mean = p_sum / len(sed_sessions)
+    if len(p_mean) > 1:
+        p_mean = gaussian_filter1d(p_mean, sigma=0.65, axis=0,
+                                   mode="nearest").astype(np.float32)
+
+    stem = path.stem
+    sed_rows.extend([f"{stem}_{int(t)}" for t in ends])
+    sed_preds.append(p_mean)
+
+    if i == 1 or i % 50 == 0 or i == len(test_paths):
+        print(f"SED: {i}/{len(test_paths)} | {time.time()-_t0_sed:.1f}s")
+
+sed_preds_arr = np.concatenate(sed_preds, axis=0)
+sed_sub = pd.DataFrame(np.clip(sed_preds_arr, 0.0, 1.0), columns=PRIMARY_LABELS)
+sed_sub.insert(0, "row_id", sed_rows)
+sed_sub.to_csv("submission_sed.csv", index=False)
+print(f"Saved submission_sed.csv: {sed_sub.shape}")
+# ── Cell 11b: Proposal G — Blend ratio grid search ────────────────────
+# dry-run時のみ実行: ラベル付きtrain fileを使って最適SED_Wを探索
+# submit時はDEFAULT_SED_Wをそのまま使用
+
+DEFAULT_SED_W = 0.40
+
+if IS_DRY_RUN:
+    _a_dr = pd.read_csv("submission_protossm.csv")
+    _b_dr = pd.read_csv("submission_sed.csv")
+    _cols_dr = [c for c in _a_dr.columns if c != "row_id"]
+
+    # dry-runファイルのY_trueをsc DataFrameから復元
+    _rid2y = sc.set_index("row_id")[PRIMARY_LABELS].to_dict("index")
+    _common = [r for r in _a_dr["row_id"].tolist() if r in _rid2y]
+
+    if len(_common) >= N_WINDOWS:
+        _idx  = _a_dr["row_id"].isin(_common)
+        _b_dr = _b_dr.set_index("row_id").loc[_a_dr["row_id"]].reset_index()
+
+        _pa_dr = np.clip(_a_dr.loc[_idx, _cols_dr].to_numpy(np.float32), 1e-5, 1 - 1e-5)
+        _pb_dr = np.clip(_b_dr.loc[_idx, _cols_dr].to_numpy(np.float32), 1e-5, 1 - 1e-5)
+        _Y_dr  = np.array(
+            [[_rid2y[r][c] for c in _cols_dr]
+             for r in _a_dr.loc[_idx, "row_id"]],
+            dtype=np.float32
+        )
+
+        def _logit_blend_auc(pa, pb, sed_w, Y):
+            la = np.log(pa / (1.0 - pa))
+            lb = np.log(pb / (1.0 - pb))
+            p  = 1.0 / (1.0 + np.exp(-np.clip(la * (1 - sed_w) + lb * sed_w, -30, 30)))
+            keep = Y.sum(axis=0) > 0
+            return roc_auc_score(Y[:, keep], p[:, keep], average="macro")
+
+        print("Proposal G: SED_W grid search (logit blend, dry-run labels):")
+        _g_results = {}
+        for _w in [0.25, 0.30, 0.35, 0.38, 0.40, 0.42, 0.45, 0.50]:
+            _auc = _logit_blend_auc(_pa_dr, _pb_dr, _w, _Y_dr)
+            _g_results[_w] = _auc
+            _marker = "  ← current default" if _w == DEFAULT_SED_W else ""
+            print(f"  SED_W={_w:.2f}  AUC={_auc:.6f}{_marker}")
+
+        OPTIMAL_SED_W = max(_g_results, key=_g_results.get)
+        _delta = _g_results[OPTIMAL_SED_W] - _g_results.get(DEFAULT_SED_W, 0.0)
+        print(f"\n最適 SED_W = {OPTIMAL_SED_W}  (AUC={_g_results[OPTIMAL_SED_W]:.6f})")
+        print(f"Δ vs default ({DEFAULT_SED_W}): {_delta:+.6f}")
+        del _a_dr, _b_dr, _pa_dr, _pb_dr, _Y_dr, _rid2y
+    else:
+        OPTIMAL_SED_W = DEFAULT_SED_W
+        print(f"Y_true行数不足 ({len(_common)}) — デフォルト SED_W={DEFAULT_SED_W} を使用")
+else:
+    OPTIMAL_SED_W = DEFAULT_SED_W
+    print(f"Submit mode — SED_W={OPTIMAL_SED_W}")
+# ── Cell 12: Final Blend — Proposal A (Dynamic SED_W) + Proposal G ────
+# Proposal A: ProtoSSMが連続窓で同クラスを予測している場合、
+#             fat-tail kernelで継続性スコアを計算し、SED_Wを動的に下げる
+# Proposal G: Cell 11bで求めた最適SED_Wをベースとして使用
+
+PROTOSSM_CSV = "submission_protossm.csv"
+SED_CSV      = "submission_sed.csv"
+OUT_CSV      = "submission.csv"
+EPS          = 1e-5
+
+SED_W = OPTIMAL_SED_W   # Proposal G の結果を反映
+
+try:
+    _tax = pd.read_csv(BASE / "taxonomy.csv")
+    class_name_map = _tax.set_index("primary_label")["class_name"].to_dict()
+except Exception:
+    class_name_map = {}
+
+a = pd.read_csv(PROTOSSM_CSV)
+b = pd.read_csv(SED_CSV)
+cols = [c for c in a.columns if c != "row_id"]
+
+b = b.set_index("row_id").loc[a["row_id"]].reset_index()
+
+pa = np.clip(a[cols].to_numpy(np.float32), EPS, 1.0 - EPS)
+pb = np.clip(b[cols].to_numpy(np.float32), EPS, 1.0 - EPS)
+
+row_ids  = a["row_id"].astype(str).to_numpy()
+file_ids = np.array(["_".join(r.split("_")[:-1]) for r in row_ids])
+
+
+def _to_logit(p):
+    return np.log(p / (1.0 - p))
+
+
+def _to_prob(x):
+    return (1.0 / (1.0 + np.exp(-np.clip(x, -30, 30)))).astype(np.float32)
+
+
+# ── Proposal A: Dynamic per-cell SED_W ────────────────────────────────
+def compute_dynamic_sed_weight(pa, file_ids, base_sed_w=0.40,
+                                n_windows=12, radius=3, df=1.5, scale=1.2,
+                                consistency_boost=0.15):
+    """
+    ProtoSSMの時間継続性が高い(file, class, window)セルでは
+    SED_Wを下げてProtoSSMを優先する。
+    - consistency = pa[t] * fat_tail_context[t]  (両方高い = fat-tail持続信号)
+    - sed_w_dyn  = base_sed_w - consistency_boost * clip(consistency*4, 0, 1)
+    - 範囲: [0.05, base_sed_w]
+    """
+    N, C  = pa.shape
+    sed_w = np.full((N, C), base_sed_w, dtype=np.float32)
+
+    offs   = np.arange(-radius, radius + 1, dtype=np.float32)
+    kernel = (1.0 + (offs / scale) ** 2 / df) ** (-(df + 1.0) / 2.0)
+    kernel /= kernel.sum()
+
+    for fid in pd.unique(file_ids):
+        mask = file_ids == fid
+        x    = pa[mask]
+        if len(x) != n_windows:
+            continue
+        xp          = np.pad(x, ((radius, radius), (0, 0)), mode="edge")
+        ctx         = sum(kernel[i] * xp[i:i + n_windows] for i in range(2 * radius + 1))
+        consistency = x * ctx
+        reduction   = consistency_boost * np.clip(consistency * 4, 0.0, 1.0)
+        sed_w[mask] = np.clip(base_sed_w - reduction, 0.05, base_sed_w)
+
+    return sed_w
+
+
+logit_a   = _to_logit(pa)
+logit_b   = _to_logit(pb)
+sed_w_dyn = compute_dynamic_sed_weight(pa, file_ids, base_sed_w=SED_W)
+
+# 動的ブレンド（logit空間）
+blended_logit = logit_a * (1.0 - sed_w_dyn) + logit_b * sed_w_dyn
+pred          = _to_prob(blended_logit)
+
+# 診断ログ
+_reduced = (sed_w_dyn < SED_W - 0.05).sum()
+print(f"Proposal A — Dynamic SED_W: "
+      f"mean={sed_w_dyn.mean():.4f}  "
+      f"min={sed_w_dyn.min():.4f}  "
+      f"max={sed_w_dyn.max():.4f}")
+print(f"  継続性強化セル: {_reduced:,} / {sed_w_dyn.size:,} "
+      f"({100 * _reduced / sed_w_dyn.size:.1f}%)")
+print(f"Proposal G — Base SED_W = {SED_W:.2f} (from grid search or default)")
+
+# ── 条件判定用ランク ──────────────────────────────────────────────────
+xa = pd.DataFrame(pa).rank(axis=0, pct=True).to_numpy(np.float32)
+xb = pd.DataFrame(pb).rank(axis=0, pct=True).to_numpy(np.float32)
+
+
+# ── 1) ProtoSSM 単独高スコア → ProtoSSM へ追加ブレンド ─────────────────
+FAKE_ONLY_THR   = 0.50
+SED_LOW_THR     = 0.05
+FAKE_ONLY_BLEND = 0.12
+
+fake_only = (pa > FAKE_ONLY_THR) & (pb < SED_LOW_THR)
+pred = np.where(fake_only,
+                (1.0 - FAKE_ONLY_BLEND) * pred + FAKE_ONLY_BLEND * pa,
+                pred)
+
+
+def _fat_tail_kernel(radius, df, scale):
+    offs   = np.arange(-radius, radius + 1, dtype=np.float32)
+    kernel = (1.0 + (offs / scale) ** 2 / df) ** (-(df + 1.0) / 2.0)
+    return (kernel / kernel.sum()).astype(np.float32)
+
+
+# ── 2) Proto 時間継続性レスキュー（Taxon-Aware） ──────────────────────
+PROTO_CONT_RADIUS    = 3
+PROTO_CONT_DF        = 2.0
+PROTO_CONT_SCALE     = 1.20
+PROTO_CONT_RANK_THR  = 0.88
+PROTO_LOCAL_RANK_THR = 0.75
+SED_CONT_LOW_THR     = 0.12
+PROTO_CONT_BLEND     = 0.15
+
+# ── 3) SED 時間継続性レスキュー ────────────────────────────────────────
+SED_CONT_RADIUS    = 2
+SED_CONT_DF        = 2.0
+SED_CONT_SCALE     = 1.00
+SED_CONT_RANK_THR  = 0.90
+SED_LOCAL_RANK_THR = 0.80
+PROTO_CONT_LOW_THR = 0.15
+SED_CONT_BLEND     = 0.12
+
+proto_kernel = _fat_tail_kernel(PROTO_CONT_RADIUS, PROTO_CONT_DF, PROTO_CONT_SCALE)
+sed_kernel   = _fat_tail_kernel(SED_CONT_RADIUS,   SED_CONT_DF,   SED_CONT_SCALE)
+
+pa_ctx = pa.copy()
+pb_ctx = pb.copy()
+R_p, R_s = PROTO_CONT_RADIUS, SED_CONT_RADIUS
+
+for fid in pd.unique(file_ids):
+    m   = file_ids == fid
+    x_a = pa[m]; x_b = pb[m]
+    if len(x_a) > 1:
+        xp_a = np.pad(x_a, ((R_p, R_p), (0, 0)), mode="edge")
+        pa_ctx[m] = sum(proto_kernel[i] * xp_a[i:i + len(x_a)]
+                        for i in range(2 * R_p + 1))
+        xp_b = np.pad(x_b, ((R_s, R_s), (0, 0)), mode="edge")
+        pb_ctx[m] = sum(sed_kernel[i] * xp_b[i:i + len(x_b)]
+                        for i in range(2 * R_s + 1))
+
+xctx_a = pd.DataFrame(pa_ctx).rank(axis=0, pct=True).to_numpy(np.float32)
+xctx_b = pd.DataFrame(pb_ctx).rank(axis=0, pct=True).to_numpy(np.float32)
+
+# Amphibia / Insecta は閾値を 0.05 下げて感度を上げる
+taxon_mask = np.array([
+    class_name_map.get(c, "Aves") in ["Amphibia", "Insecta"]
+    for c in cols
+], dtype=bool)
+proto_rank_thr_dyn = np.where(taxon_mask,
+                               PROTO_CONT_RANK_THR - 0.05,
+                               PROTO_CONT_RANK_THR)
+
+proto_cont = (
+    (xctx_a > proto_rank_thr_dyn) &
+    (xa     > PROTO_LOCAL_RANK_THR) &
+    (pb     < SED_CONT_LOW_THR) &
+    (~fake_only)
+)
+pred = np.where(proto_cont,
+                (1.0 - PROTO_CONT_BLEND) * pred
+                + PROTO_CONT_BLEND * np.maximum(pa, pa_ctx),
+                pred)
+
+sed_cont = (
+    (xctx_b > SED_CONT_RANK_THR) &
+    (xb     > SED_LOCAL_RANK_THR) &
+    (pa     < PROTO_CONT_LOW_THR) &
+    (~fake_only) & (~proto_cont)
+)
+pred = np.where(sed_cont,
+                (1.0 - SED_CONT_BLEND) * pred
+                + SED_CONT_BLEND * np.maximum(pb, pb_ctx),
+                pred)
+
+# ── 4) 希少 SED スパイクレスキュー ────────────────────────────────────
+SED_ONLY_RANK_THR = 0.95
+FAKE_RANK_LOW_THR = 0.80
+SED_ONLY_BLEND    = 0.12
+
+sed_only = (
+    (xb > SED_ONLY_RANK_THR) &
+    (xa < FAKE_RANK_LOW_THR) &
+    (~fake_only) & (~proto_cont) & (~sed_cont)
+)
+pred = np.where(sed_only,
+                (1.0 - SED_ONLY_BLEND) * pred + SED_ONLY_BLEND * pb,
+                pred)
+
+# ── 最終保存 ─────────────────────────────────────────────────────────
+if IS_DRY_RUN:
+    print("Dry-run: sample-aligned validation submission を書き出し")
+    sample_public = pd.read_csv(BASE / "sample_submission.csv")
+    template      = pred.mean(axis=0).astype(np.float32)
+    sub_out = sample_public.copy()
+    for _i, _lbl in enumerate(cols):
+        if _lbl in sub_out.columns:
+            sub_out[_lbl] = template[_i]
+    sub_out.to_csv(OUT_CSV, index=False)
+    print(f"Saved {OUT_CSV} (sample-aligned) — shape {sub_out.shape}")
+else:
+    sub_out        = a.copy()
+    sub_out[cols]  = pred.astype(np.float32)
+    sub_out.to_csv(OUT_CSV, index=False)
+    print(f"Saved {OUT_CSV} — shape {sub_out.shape}")
+
+print(f"\nBlend: Logit({1-SED_W:.2f}×ProtoSSM + {SED_W:.2f}×SED) "
+      f"with Dynamic fat-tail weighting + Prob-based rescues")
+print(f"Rescue rates — "
+      f"fake_only: {fake_only.mean():.3%}  "
+      f"proto_cont: {proto_cont.mean():.3%}  "
+      f"sed_cont: {sed_cont.mean():.3%}  "
+      f"sed_only: {sed_only.mean():.3%}")
+print(f"Total wall time: {(time.time() - _WALL_START)/60:.1f} min")
+
