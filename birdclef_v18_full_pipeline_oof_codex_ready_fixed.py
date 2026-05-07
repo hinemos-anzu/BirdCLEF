@@ -2110,10 +2110,19 @@ if IS_DRY_RUN:
             _marker = "  ← current default" if _w == DEFAULT_SED_W else ""
             print(f"  SED_W={_w:.2f}  AUC={_auc:.6f}{_marker}")
 
-        OPTIMAL_SED_W = max(_g_results, key=_g_results.get)
+        _best_uncapped = max(_g_results, key=_g_results.get)
+        # dry-runではProtoSSMが訓練データを記憶しているためAUCが上振れする。
+        # SED_Wを上げるほど良く見えるのはリークによるアーティファクト。
+        # 「現在のデフォルト以下に下げる」方向のみ採用する。
+        OPTIMAL_SED_W = min(_best_uncapped, DEFAULT_SED_W)
         _delta = _g_results[OPTIMAL_SED_W] - _g_results.get(DEFAULT_SED_W, 0.0)
-        print(f"\n最適 SED_W = {OPTIMAL_SED_W}  (AUC={_g_results[OPTIMAL_SED_W]:.6f})")
+        print(f"\n[参考] リーク込みの最適 SED_W = {_best_uncapped}  "
+              f"(AUC={_g_results[_best_uncapped]:.6f})")
+        print(f"[採用] キャップ後 SED_W = {OPTIMAL_SED_W}  "
+              f"(AUC={_g_results[OPTIMAL_SED_W]:.6f})")
         print(f"Δ vs default ({DEFAULT_SED_W}): {_delta:+.6f}")
+        print("Note: dry-runのProtoSSMスコアは訓練済みデータのため過学習。"
+              "SED_Wの上方修正はリークアーティファクト。")
         del _a_dr, _b_dr, _pa_dr, _pb_dr, _Y_dr, _rid2idx
     else:
         OPTIMAL_SED_W = DEFAULT_SED_W
