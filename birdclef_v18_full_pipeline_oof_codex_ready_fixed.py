@@ -1806,14 +1806,13 @@ test_hour_ids = np.array([
     int(meta_te.loc[meta_te["filename"]==fn,"hour_utc"].iloc[0]) % 24
     for fn in test_fnames], dtype=np.int64)
 
-proto_model.eval()
-with torch.no_grad():
-    proto_out = proto_model(
-        torch.tensor(emb_te_f, dtype=torch.float32),
-        torch.tensor(sc_te_f,  dtype=torch.float32),
-        site_ids=torch.tensor(test_site_ids, dtype=torch.long),
-        hours   =torch.tensor(test_hour_ids, dtype=torch.long),
-    ).numpy()
+# ── 2-A: TTA on test (5 circular shifts, same as training side) ────────
+proto_out = run_tta_proto(
+    proto_model, emb_te_f, sc_te_f,
+    site_t=torch.tensor(test_site_ids, dtype=torch.long),
+    hour_t=torch.tensor(test_hour_ids, dtype=torch.long),
+    shifts=[0, 1, -1, 2, -2],
+)
 proto_scores_flat = proto_out.reshape(-1, N_CLASSES).astype(np.float32)
 
 # ── Step C: Prior tables ───────────────────────────────────────────────
