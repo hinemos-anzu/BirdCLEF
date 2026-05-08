@@ -2423,11 +2423,15 @@ print("\nCell 12 完了")
 
 # ── ブレンド比率 手動上書き（LB実験用） ────────────────────────────────────
 # OOF最適化の結果を無視して任意の比率で提出したい場合にコメントを外す。
-# Submit A: BLEND_W_PROTO = 1.00  → ProtoSSM 単体           LB: 0.927
-# Submit B: BLEND_W_PROTO = 0.50  → 均等ブレンド             LB: 0.941
-# Submit C: BLEND_W_PROTO = 0.60  → 元の設定比率 (TTA あり)  LB: ?
-# Submit D: BLEND_W_PROTO = 0.55  → 次候補                   LB: ?
-BLEND_W_PROTO = 0.60   # ← Submit C
+# ── LB 実験ログ（TTA なし） ────────────────────────────────────────────
+# Submit A: BLEND_W_PROTO = 1.00  (w_sed=0.00)  LB: 0.927
+# Submit B: BLEND_W_PROTO = 0.50  (w_sed=0.50)  LB: 0.941
+# [元設定]: BLEND_W_PROTO = 0.60  (w_sed=0.40)  LB: 0.946  ← 現在のベスト
+# Submit C: BLEND_W_PROTO = 0.65  (w_sed=0.35)  LB: ?      ← 今回
+# Submit D: BLEND_W_PROTO = 0.70  (w_sed=0.30)  LB: ?      ← C>0.946 なら
+# ── TTA あり（比率確定後に試す） ────────────────────────────────────────
+# Submit E: BLEND_W_PROTO = best  (TTA on)       LB: ?
+BLEND_W_PROTO = 0.65   # ← Submit C: w_sed=0.35
 BLEND_W_SED   = 1.0 - BLEND_W_PROTO
 print(f"[手動上書き] w_proto={BLEND_W_PROTO:.2f} / w_sed={BLEND_W_SED:.2f}")
 
