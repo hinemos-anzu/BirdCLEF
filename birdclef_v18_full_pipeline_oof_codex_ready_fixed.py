@@ -1956,5 +1956,596 @@ sub.to_csv("submission.csv", index=False)
 print(f"\nsubmission.csv saved — shape {sub.shape}")
 print(f"Total wall time: {(time.time() - _WALL_START)/60:.1f} min")
 
+# ProtoSSM単体提出を別名でも保存（後段のブレンドセルで参照する）
+sub.to_csv("submission_protossm.csv", index=False)
+print("submission_protossm.csv も保存しました（SEDブレンド用）")
+
+# ── Cell 11: Distilled SED Branch ─────────────────────────────────────
+# Tucker Arrants 公開 ONNX folds を使い mel-spectrogram ベースの予測を生成する。
+# テストデータへの推論 → submission_sed.csv
+# 訓練データへの推論 → sed_preds_tr_aligned  （Cell 12 のブレンド比率最適化用）
+#
+# 注意: SED モデルは競技訓練データで蒸留済みのため、訓練データへの適用は
+#       厳密な意味でのリークを含む。ただし目的はブレンド比率のキャリブレーション
+#       のみであり、最終スコアの絶対値ではなく比率の相対比較に使用する。
+
+import librosa
+from scipy.ndimage import gaussian_filter1d
+
+N_MELS_SED = 256
+N_FFT_SED  = 2048
+HOP_SED    = 512
+FMIN_SED   = 20
+FMAX_SED   = 16_000
+TOP_DB_SED = 80
+
+def _find_sed_dir():
+    hits = sorted(Path("/kaggle/input").rglob("sed_fold0.onnx"))
+    if not hits:
+        raise FileNotFoundError("sed_fold0.onnx が見つかりません。")
+    return hits[0].parent
+
+def _make_sed_session(path):
+    so = ort.SessionOptions()
+    so.intra_op_num_threads  = 4
+    so.inter_op_num_threads  = 1
+    so.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
+    return ort.InferenceSession(
+        str(path), sess_options=so, providers=["CPUExecutionProvider"]
+    )
+
+def audio_to_mel(chunks):
+    """(n_chunks, WINDOW_SAMPLES) → (n_chunks, 1, N_MELS, T) float32"""
+    mels = []
+    for x in chunks:
+        s = librosa.feature.melspectrogram(
+            y=x, sr=SR, n_fft=N_FFT_SED, hop_length=HOP_SED,
+            n_mels=N_MELS_SED, fmin=FMIN_SED, fmax=FMAX_SED, power=2.0,
+        )
+        s = librosa.power_to_db(s, top_db=TOP_DB_SED)
+        s = (s - s.mean()) / (s.std() + 1e-6)
+        mels.append(s)
+    return np.stack(mels)[:, None].astype(np.float32)
+
+def file_to_sed_chunks(path):
+    """60 秒音声 → (12, WINDOW_SAMPLES) chunks と秒数ラベル"""
+    y, sr0 = sf.read(str(path), dtype="float32", always_2d=False)
+    if y.ndim == 2:
+        y = y.mean(axis=1)
+    if sr0 != SR:
+        y = librosa.resample(y, orig_sr=sr0, target_sr=SR)
+    n = 60 * SR
+    y = np.pad(y, (0, max(0, n - len(y))))[:n]
+    chunks = y.reshape(N_WINDOWS, WINDOW_SAMPLES)
+    ends   = np.arange(1, N_WINDOWS + 1) * WINDOW_SEC
+    return chunks, ends
+
+def sigmoid_sed(x):
+    return (1.0 / (1.0 + np.exp(-np.clip(x, -50, 50)))).astype(np.float32)
+
+def run_sed_on_paths(audio_paths, sed_sessions_list, desc="SED"):
+    """
+    SED ONNX folds を指定パスに適用し (row_ids, probs) を返す。
+    probs: (n_paths * N_WINDOWS, N_CLASSES) float32
+    """
+    all_rows, all_preds = [], []
+    for path in tqdm(audio_paths, desc=desc):
+        chunks, ends = file_to_sed_chunks(path)
+        mel   = audio_to_mel(chunks)
+        p_sum = np.zeros((len(chunks), N_CLASSES), dtype=np.float32)
+        for sess in sed_sessions_list:
+            outs   = sess.run(None, {sess.get_inputs()[0].name: mel})
+            p_sum += 0.5 * sigmoid_sed(outs[0]) + 0.5 * sigmoid_sed(outs[1].max(axis=1))
+        p_mean = (p_sum / len(sed_sessions_list)).astype(np.float32)
+        if len(p_mean) > 1:
+            p_mean = gaussian_filter1d(
+                p_mean, sigma=0.65, axis=0, mode="nearest"
+            ).astype(np.float32)
+        stem = path.stem
+        all_rows.extend([f"{stem}_{int(t)}" for t in ends])
+        all_preds.append(p_mean)
+    preds_arr = np.clip(np.concatenate(all_preds, axis=0), 0.0, 1.0)
+    return np.array(all_rows), preds_arr
+
+# ---- SED セッション初期化 -----------------------------------------------
+_SED_AVAILABLE = False
+sed_sessions   = []
+try:
+    _sed_dir        = _find_sed_dir()
+    _sed_fold_paths = sorted(
+        _sed_dir.glob("sed_fold*.onnx"),
+        key=lambda p: int(re.search(r"sed_fold(\d+)", p.name).group(1)),
+    )
+    sed_sessions    = [_make_sed_session(p) for p in _sed_fold_paths]
+    _SED_AVAILABLE  = True
+    print(f"SED: {len(sed_sessions)} folds  dir={_sed_dir}")
+except FileNotFoundError as _e:
+    print(f"SED ONNX が見つかりません: {_e}")
+    print("  → SED ブランチをスキップ。ProtoSSM 単体提出を使用します。")
+
+# ---- テストデータへの SED 推論 -------------------------------------------
+if _SED_AVAILABLE:
+    _test_paths_sed = sorted((BASE / "test_soundscapes").glob("*.ogg"))
+    if not _test_paths_sed:
+        _n = CFG["dryrun_n_files"] or 20
+        _test_paths_sed = sorted((BASE / "train_soundscapes").glob("*.ogg"))[:_n]
+        print(f"Dry-run: SED を訓練音声 {len(_test_paths_sed)} ファイルで実行")
+
+    _sed_rows_te, _sed_preds_te = run_sed_on_paths(
+        _test_paths_sed, sed_sessions, desc="SED (test)"
+    )
+    _sed_sub = pd.DataFrame(
+        np.clip(_sed_preds_te, 0.0, 1.0), columns=PRIMARY_LABELS
+    )
+    _sed_sub.insert(0, "row_id", _sed_rows_te)
+    _sed_sub.to_csv("submission_sed.csv", index=False)
+    print(f"submission_sed.csv 保存完了  shape={_sed_sub.shape}")
+
+    # ---- 訓練データへの SED 推論（ブレンド比率最適化用） --------------------
+    _train_paths_sed = sorted(
+        (BASE / "train_soundscapes").glob("*.ogg")
+    )
+    _train_paths_sed = [p for p in _train_paths_sed if p.name in set(full_files)]
+
+    _sed_rows_tr, _sed_preds_tr_raw = run_sed_on_paths(
+        _train_paths_sed, sed_sessions, desc="SED (train-OOF)"
+    )
+    _sed_row_to_idx = {rid: i for i, rid in enumerate(_sed_rows_tr)}
+    _tr_row_ids     = meta_tr["row_id"].to_numpy()
+
+    _missing = set(_tr_row_ids) - set(_sed_row_to_idx)
+    if _missing:
+        raise RuntimeError(
+            f"SED予測にないrow_id: {len(_missing)}件 — "
+            "full_files に含まれない訓練ファイルが存在します。"
+        )
+    _aligned_idx          = np.array([_sed_row_to_idx[r] for r in _tr_row_ids])
+    sed_preds_tr_aligned  = _sed_preds_tr_raw[_aligned_idx]  # (708, 234)
+
+    _sed_tr_auc = macro_auc(Y_FULL_aligned, sed_preds_tr_aligned)
+    print(f"SED (train) AUC: {_sed_tr_auc:.6f}  shape={sed_preds_tr_aligned.shape}")
+    print("Cell 11 完了")
+else:
+    sed_preds_tr_aligned = None
+    print("SED 利用不可 — Cell 12 はグリッド探索をスキップします。")
+
+# ── Cell 12: S1 OOF評価 + ブレンド比率最適化 ──────────────────────────────
+# 設計方針:
+#   ① ProtoSSM フルパイプライン OOF（Prior + ResidualSSM + 後処理込み）
+#   ② SED 訓練データ予測（Cell 11 で取得済み）
+#   ③ 両者のランク変換後に grid search + 任意で Optuna 精密探索
+#   ④ 最適ウェイトを BLEND_W_PROTO / BLEND_W_SED に格納
+#
+# 挿入位置: Cell 10（ProtoSSM実行）の後、Cell 13（最終ブレンド）の前
+
+# ---------- 12-A: OOF 設定 ------------------------------------------------
+_OOF_N_SPLITS  = 3      # 59 ファイル → 3-fold が現実的（各fold ~20 val files）
+_OOF_N_EPOCHS  = 40     # ProtoSSM fold 学習エポック
+_OOF_PATIENCE  = 8
+_RES_N_EPOCHS  = 20     # ResidualSSM fold 学習エポック（軽量化）
+_RES_PATIENCE  = 6
+_N_SITES_CAP   = 20
+_EPS           = 1e-5
+
+# ---------- 12-B: OOF キャッシュ ------------------------------------------
+_OOF_CACHE = WORK_DIR / "oof_proto_probs.npy"
+
+def _get_site_hour_ids_for_fold(meta_df, fn_list, site2i,
+                                 n_sites_cap=_N_SITES_CAP):
+    """ファイルリストからサイト/時刻IDを取得するユーティリティ。"""
+    site_ids = np.array([
+        min(site2i.get(
+            meta_df.loc[meta_df["filename"] == fn, "site"].iloc[0], 0),
+            n_sites_cap - 1)
+        for fn in fn_list
+    ], dtype=np.int64)
+    hour_ids = np.array([
+        int(meta_df.loc[meta_df["filename"] == fn, "hour_utc"].iloc[0]) % 24
+        for fn in fn_list
+    ], dtype=np.int64)
+    return site_ids, hour_ids
+
+def run_full_pipeline_oof_v2(
+    emb_full, sc_full, Y_full, meta_full,
+    n_splits=3, n_epochs=40, patience=8,
+    res_n_epochs=20, res_patience=6,
+):
+    """
+    GroupKFold OOF で ProtoSSM + MLP + Prior + ResidualSSM +
+    後処理（温度スケーリング・FileConfidenceScale・RankAwareScale・
+    AdaptiveDeltaSmooth）まで含んだ完全パイプラインを実行する。
+
+    既存 run_pipeline_oof との差分:
+      - apply_prior                  追加
+      - train_residual_ssm           追加
+      - temperature scaling          追加
+      - file_confidence_scale        追加
+      - rank_aware_scaling           追加
+      - adaptive_delta_smooth        追加
+
+    Returns
+    -------
+    oof_probs : np.ndarray (n_windows, N_CLASSES) float32
+    overall_auc : float
+    """
+    file_meta = meta_full.drop_duplicates("filename").reset_index(drop=True)
+    gkf       = GroupKFold(n_splits=n_splits)
+    oof_probs = np.zeros((len(sc_full), N_CLASSES), dtype=np.float32)
+
+    # Prior テーブルは全訓練データから構築（fold 外で一度だけ）
+    _prior = build_prior_tables(sc, Y_SC)
+
+    for fold, (tr_f, va_f) in enumerate(
+        gkf.split(file_meta, groups=file_meta["filename"]), 1
+    ):
+        t_fold = time.time()
+        tr_fnames = set(file_meta.iloc[tr_f]["filename"])
+        va_fnames = set(file_meta.iloc[va_f]["filename"])
+
+        tr_mask = meta_full["filename"].isin(tr_fnames).values
+        va_mask = meta_full["filename"].isin(va_fnames).values
+
+        emb_tr_f  = emb_full[tr_mask];  sc_tr_f  = sc_full[tr_mask]
+        Y_tr_f    = Y_full[tr_mask];    meta_tr_f = meta_full[tr_mask].reset_index(drop=True)
+        emb_va_f  = emb_full[va_mask];  sc_va_f  = sc_full[va_mask]
+        meta_va_f = meta_full[va_mask].reset_index(drop=True)
+
+        n_va = len(emb_va_f) // N_WINDOWS
+        n_tr = len(emb_tr_f) // N_WINDOWS
+
+        # ---- ProtoSSM 訓練 ------------------------------------------------
+        proto_model, site2i = train_light_proto_ssm(
+            emb_tr_f, sc_tr_f, Y_tr_f, meta_tr_f,
+            n_epochs=n_epochs, patience=patience, lr=1e-3, verbose=False,
+        )
+
+        # ---- 検証: ProtoSSM 予測 ------------------------------------------
+        va_fn_list = meta_va_f.drop_duplicates("filename")["filename"].tolist()
+        va_site_ids, va_hour_ids = _get_site_hour_ids_for_fold(
+            meta_va_f, va_fn_list, site2i)
+
+        proto_model.eval()
+        with torch.no_grad():
+            proto_va = proto_model(
+                torch.tensor(emb_va_f.reshape(n_va, N_WINDOWS, -1), dtype=torch.float32),
+                torch.tensor(sc_va_f.reshape(n_va, N_WINDOWS, -1),  dtype=torch.float32),
+                site_ids=torch.tensor(va_site_ids, dtype=torch.long),
+                hours   =torch.tensor(va_hour_ids, dtype=torch.long),
+            ).numpy().reshape(-1, N_CLASSES)
+
+        # ---- 検証: Prior + MLP Probes ------------------------------------
+        sc_va_prior = apply_prior(
+            sc_va_f,
+            sites=meta_va_f["site"].to_numpy(),
+            hours=meta_va_f["hour_utc"].to_numpy(),
+            tables=_prior, lambda_prior=0.4,
+        )
+        probe_models, emb_scaler, emb_pca, alpha_blend = train_mlp_probes(
+            emb=emb_tr_f, scores_raw=sc_tr_f, Y=Y_tr_f,
+            min_pos=5, pca_dim=64, alpha_blend=0.4,
+        )
+        sc_va_mlp = apply_mlp_probes_vectorized(
+            emb_va_f, sc_va_prior,
+            probe_models, emb_scaler, emb_pca, alpha_blend,
+        )
+        first_pass_va = 0.5 * proto_va + 0.5 * sc_va_mlp
+
+        # ---- 訓練: ResidualSSM 用の first_pass を生成 --------------------
+        tr_fn_list = meta_tr_f.drop_duplicates("filename")["filename"].tolist()
+        tr_site_ids_f, tr_hour_ids_f = _get_site_hour_ids_for_fold(
+            meta_tr_f, tr_fn_list, site2i)
+
+        # 訓練側は TTA あり（元パイプラインと同設計）
+        proto_tr_tta = run_tta_proto(
+            proto_model,
+            emb_tr_f.reshape(n_tr, N_WINDOWS, -1),
+            sc_tr_f.reshape(n_tr, N_WINDOWS, -1),
+            site_t=torch.tensor(tr_site_ids_f, dtype=torch.long),
+            hour_t=torch.tensor(tr_hour_ids_f, dtype=torch.long),
+            shifts=[0, 1, -1, 2, -2],
+        )
+        sc_tr_prior_f = apply_prior(
+            sc_tr_f,
+            sites=meta_tr_f["site"].to_numpy(),
+            hours=meta_tr_f["hour_utc"].to_numpy(),
+            tables=_prior, lambda_prior=0.4,
+        )
+        sc_tr_mlp_f = apply_mlp_probes_vectorized(
+            emb_tr_f, sc_tr_prior_f,
+            probe_models, emb_scaler, emb_pca, alpha_blend,
+        )
+        first_pass_tr_f = (
+            0.5 * proto_tr_tta.reshape(-1, N_CLASSES) + 0.5 * sc_tr_mlp_f
+        )
+
+        # ---- ResidualSSM 訓練 & 検証適用 ---------------------------------
+        res_model, correction_weight = train_residual_ssm(
+            emb_full=emb_tr_f,
+            first_pass_flat=first_pass_tr_f,
+            Y_full=Y_tr_f,
+            site_ids=tr_site_ids_f,
+            hour_ids=tr_hour_ids_f,
+            n_epochs=res_n_epochs, patience=res_patience,
+            lr=1e-3, correction_weight=0.30, verbose=False,
+        )
+
+        res_model.eval()
+        with torch.no_grad():
+            va_correction = res_model(
+                torch.tensor(emb_va_f.reshape(n_va, N_WINDOWS, -1), dtype=torch.float32),
+                torch.tensor(first_pass_va.reshape(n_va, N_WINDOWS, -1), dtype=torch.float32),
+                site_ids=torch.tensor(va_site_ids, dtype=torch.long),
+                hours   =torch.tensor(va_hour_ids, dtype=torch.long),
+            ).numpy().reshape(-1, N_CLASSES)
+
+        # ---- 後処理（元パイプライン Step G-I と同一） --------------------
+        final_va = first_pass_va + correction_weight * va_correction
+        final_va = final_va / temperatures[None, :]          # 温度スケーリング
+        probs_va = sigmoid(final_va)
+        probs_va = file_confidence_scale(probs_va, n_windows=N_WINDOWS, top_k=2, power=0.4)
+        probs_va = rank_aware_scaling(probs_va, n_windows=N_WINDOWS, power=0.4)
+        probs_va = adaptive_delta_smooth(probs_va, n_windows=N_WINDOWS, base_alpha=0.20)
+        probs_va = np.clip(probs_va, 0.0, 1.0).astype(np.float32)
+
+        oof_probs[va_mask] = probs_va
+
+        fold_auc = macro_auc(Y_full[va_mask], probs_va)
+        print(f"  Fold {fold}/{n_splits} | val={len(va_fnames):2d}files "
+              f"| AUC={fold_auc:.6f} | {time.time()-t_fold:.1f}s")
+
+        del proto_model, probe_models, res_model
+        gc.collect()
+
+    overall_auc = macro_auc(Y_full, oof_probs)
+    print(f"\n[ProtoSSM OOF v2] 全体 AUC: {overall_auc:.6f}")
+    return oof_probs, overall_auc
+
+# ---- OOF 実行（キャッシュ優先） -----------------------------------------
+if _OOF_CACHE.exists():
+    oof_proto_probs = np.load(str(_OOF_CACHE))
+    _proto_oof_auc  = macro_auc(Y_FULL_aligned, oof_proto_probs)
+    print(f"OOF キャッシュを読み込みました: {_OOF_CACHE}")
+    print(f"[ProtoSSM OOF v2] AUC = {_proto_oof_auc:.6f}")
+else:
+    print("="*60)
+    print("S1 Step 1: ProtoSSM フルパイプライン OOF 予測を実行中…")
+    print(f"  {_OOF_N_SPLITS}-fold GroupKFold | "
+          f"n_epochs={_OOF_N_EPOCHS} | patience={_OOF_PATIENCE}")
+    print("="*60)
+    _t0 = time.time()
+    oof_proto_probs, _proto_oof_auc = run_full_pipeline_oof_v2(
+        emb_tr, sc_tr, Y_FULL_aligned, meta_tr,
+        n_splits=_OOF_N_SPLITS,
+        n_epochs=_OOF_N_EPOCHS, patience=_OOF_PATIENCE,
+        res_n_epochs=_RES_N_EPOCHS, res_patience=_RES_PATIENCE,
+    )
+    np.save(str(_OOF_CACHE), oof_proto_probs)
+    print(f"OOF 完了: {time.time()-_t0:.1f}s  → キャッシュ保存: {_OOF_CACHE}")
+
+# ---------- 12-C: ブレンド比率最適化 ---------------------------------------
+def _to_rank(p):
+    """(N, C) 確率配列 → パーセンタイルランク配列（列方向）"""
+    return pd.DataFrame(p).rank(axis=0, pct=True).to_numpy(np.float32)
+
+def _blend_auc(rank_a, rank_b, w_a, Y_true):
+    return macro_auc(Y_true, rank_a * w_a + rank_b * (1.0 - w_a))
+
+def optimize_blend_ratio(
+    oof_proto,          # (n_windows, N_CLASSES) ProtoSSM OOF probs
+    oof_sed,            # (n_windows, N_CLASSES) SED probs on train
+    Y_true,             # ground truth
+    w_grid=None,        # グリッド探索の候補値
+    use_optuna=True,
+    n_optuna_trials=60,
+):
+    """
+    ランクベース 2-way ブレンドの最適ウェイトを OOF で探索する。
+
+    グリッド探索で大域を確認 → Optuna で精密化（任意）。
+    BLEND_W_PROTO / BLEND_W_SED をグローバルに格納して返す。
+    """
+    if w_grid is None:
+        w_grid = np.round(np.arange(0.30, 0.81, 0.05), 2)
+
+    # ランク配列を事前計算（繰り返し呼び出しを高速化）
+    r_proto = _to_rank(np.clip(oof_proto, _EPS, 1.0 - _EPS))
+    r_sed   = _to_rank(np.clip(oof_sed,   _EPS, 1.0 - _EPS))
+
+    # ---- グリッド探索 -------------------------------------------------------
+    print("\n--- グリッド探索 (w_proto: 0.30 → 0.80) ---")
+    _ref_60_40 = _blend_auc(r_proto, r_sed, 0.60, Y_true)
+    print(f"  [参考] ProtoSSM 単体   : {macro_auc(Y_true, oof_proto):.6f}")
+    print(f"  [参考] SED 単体        : {macro_auc(Y_true, oof_sed):.6f}")
+    print(f"  [参考] 固定 60/40      : {_ref_60_40:.6f}  ← 現在の設定")
+    print()
+
+    _grid = []
+    for w in w_grid:
+        auc    = _blend_auc(r_proto, r_sed, w, Y_true)
+        marker = " ←" if abs(w - 0.60) < 0.01 else ""
+        print(f"  w_proto={w:.2f} | AUC={auc:.6f}{marker}")
+        _grid.append((w, auc))
+
+    _best_w_grid, _best_auc_grid = max(_grid, key=lambda x: x[1])
+    print(f"\n[グリッド] 最良: w_proto={_best_w_grid:.2f} → AUC={_best_auc_grid:.6f} "
+          f"(Δ vs 60/40 = {_best_auc_grid - _ref_60_40:+.6f})")
+
+    _best_w = _best_w_grid
+
+    # ---- Optuna 精密探索（任意） -------------------------------------------
+    if use_optuna:
+        try:
+            import optuna
+            optuna.logging.set_verbosity(optuna.logging.WARNING)
+
+            def _objective(trial):
+                w = trial.suggest_float("w_proto", 0.30, 0.80)
+                return _blend_auc(r_proto, r_sed, w, Y_true)
+
+            study = optuna.create_study(
+                direction="maximize",
+                sampler=optuna.samplers.TPESampler(seed=42),
+            )
+            study.enqueue_trial({"w_proto": _best_w_grid})  # グリッド最良から開始
+            study.optimize(_objective, n_trials=n_optuna_trials,
+                           show_progress_bar=True)
+
+            _best_w     = study.best_params["w_proto"]
+            _best_auc_o = study.best_value
+            print(f"\n[Optuna] 最良: w_proto={_best_w:.4f} → AUC={_best_auc_o:.6f} "
+                  f"(Δ vs グリッド = {_best_auc_o - _best_auc_grid:+.6f})")
+
+        except ImportError:
+            print("\nOptuna 未インストール → グリッド結果を採用します。")
+            print("  インストール: pip install optuna -q")
+
+    return float(_best_w), float(1.0 - _best_w)
+
+# ---- ブレンド比率を決定 ---------------------------------------------------
+if _SED_AVAILABLE and sed_preds_tr_aligned is not None:
+    print("\n" + "="*60)
+    print("S1 Step 2: ブレンド比率最適化")
+    print("="*60)
+    BLEND_W_PROTO, BLEND_W_SED = optimize_blend_ratio(
+        oof_proto=oof_proto_probs,
+        oof_sed=sed_preds_tr_aligned,
+        Y_true=Y_FULL_aligned,
+        use_optuna=True,
+        n_optuna_trials=60,
+    )
+    print(f"\n採用ブレンド比率: w_proto={BLEND_W_PROTO:.4f} / w_sed={BLEND_W_SED:.4f}")
+    print("  ※ 旧: w_proto=0.60 / w_sed=0.40 (固定値)")
+else:
+    BLEND_W_PROTO = 1.0
+    BLEND_W_SED   = 0.0
+    print("SED 利用不可 — ProtoSSM 単体 (w_proto=1.00) を使用します。")
+
+print("\nCell 12 完了")
+
+# ── Cell 13: 最適ブレンド比率で最終 submission を再生成 ─────────────────────
+# submission_protossm.csv  (Cell 10 で生成済み)
+# submission_sed.csv       (Cell 11 で生成済み)
+# → ランク平均ブレンド → 後処理 → submission.csv 上書き保存
+#
+# 後処理ロジックはオリジナルノートブックの "Rank Blend & Fat-Tail" セルと同一。
+
+print("="*60)
+print(f"S1 Step 3: 最適ブレンドで submission.csv を再生成")
+print(f"  w_proto={BLEND_W_PROTO:.4f}  w_sed={BLEND_W_SED:.4f}")
+print("="*60)
+
+if not _SED_AVAILABLE:
+    # SED が使えない場合は ProtoSSM 単体提出をそのまま使用
+    import shutil
+    shutil.copy("submission_protossm.csv", "submission.csv")
+    print("SED 利用不可 → submission_protossm.csv を submission.csv にコピーしました。")
+else:
+    _EPS_BLEND = 1e-5
+
+    _df_proto = pd.read_csv("submission_protossm.csv")
+    _df_sed   = pd.read_csv("submission_sed.csv")
+    _cols     = [c for c in _df_proto.columns if c != "row_id"]
+
+    # row_id 順序を ProtoSSM に揃える
+    _df_sed = _df_sed.set_index("row_id").loc[_df_proto["row_id"]].reset_index()
+
+    _p_proto = np.clip(_df_proto[_cols].to_numpy(np.float32), _EPS_BLEND, 1.0 - _EPS_BLEND)
+    _p_sed   = np.clip(_df_sed  [_cols].to_numpy(np.float32), _EPS_BLEND, 1.0 - _EPS_BLEND)
+
+    _r_proto = pd.DataFrame(_p_proto).rank(axis=0, pct=True).to_numpy(np.float32)
+    _r_sed   = pd.DataFrame(_p_sed  ).rank(axis=0, pct=True).to_numpy(np.float32)
+
+    # ---- 最適比率でランクブレンド -----------------------------------------
+    _pred = _r_proto * BLEND_W_PROTO + _r_sed * BLEND_W_SED
+
+    _row_ids  = _df_proto["row_id"].astype(str).to_numpy()
+    _file_ids = np.array(["_".join(r.split("_")[:-1]) for r in _row_ids])
+
+    # ---- ノイズ抑制: ProtoSSM > 0.50 かつ SED < 0.05 ----------------------
+    _fake_only = (_p_proto > 0.50) & (_p_sed < 0.05)
+    _pred = np.where(_fake_only, (1.0 - 0.08) * _pred + 0.08 * _r_proto, _pred)
+
+    # ---- 継続性ゲート: fat-tail t分布カーネル（35秒窓） --------------------
+    _offs          = np.arange(-3, 4, dtype=np.float32)
+    _proto_kernel  = (1.0 + (_offs / 1.20) ** 2 / 2.0) ** (-1.5)
+    _proto_kernel  = (_proto_kernel / _proto_kernel.sum()).astype(np.float32)
+    _pa_ctx        = _p_proto.copy()
+    for _fid in pd.unique(_file_ids):
+        _m = _file_ids == _fid
+        _x = _p_proto[_m]
+        if len(_x) > 1:
+            _xp = np.pad(_x, ((3, 3), (0, 0)), mode="edge")
+            _pa_ctx[_m] = sum(_proto_kernel[i] * _xp[i:i + len(_x)] for i in range(7))
+    _xctx       = pd.DataFrame(_pa_ctx).rank(axis=0, pct=True).to_numpy(np.float32)
+    _proto_cont = ((_xctx > 0.88) & (_r_proto > 0.75)
+                   & (_p_sed < 0.12) & (~_fake_only))
+    _pred = np.where(
+        _proto_cont,
+        (1.0 - 0.15) * _pred + 0.15 * np.maximum(_r_proto, _xctx),
+        _pred,
+    )
+
+    # ---- SED スパイク保存: SED 高信頼 + ProtoSSM 低信頼 -----------------
+    _sed_only = ((_r_sed > 0.95) & (_r_proto < 0.80)
+                 & (~_fake_only) & (~_proto_cont))
+    _pred = np.where(
+        _sed_only, (1.0 - 0.12) * _pred + 0.12 * _r_sed, _pred
+    )
+
+    # ---- 最終 DataFrame 構築 -----------------------------------------------
+    _sub = _df_proto.copy()
+    _sub[_cols] = _pred.astype(np.float32)
+
+    # ---- ソノタイプミラーリング --------------------------------------------
+    _MIRROR_PAIRS = (
+        ("47158son15", "47158son16"),
+        ("47158son09", "47158son12"),
+        ("47158son02", "47158son14"),
+        ("47158son13", "47158son21", "47158son22", "47158son23"),
+    )
+    _col_to_idx = {lbl: i for i, lbl in enumerate(_cols)}
+    _mirror_count = 0
+    for _grp in _MIRROR_PAIRS:
+        _vidx = [_col_to_idx[s] for s in _grp if s in _col_to_idx]
+        if len(_vidx) >= 2:
+            _gmax = _sub[_cols].iloc[:, _vidx].max(axis=1).to_numpy(np.float32)
+            for _idx in _vidx:
+                _sub.iloc[:, _idx + 1] = _gmax
+            _mirror_count += len(_vidx)
+    print(f"ソノタイプミラーリング: {_mirror_count} 列に適用")
+
+    # ---- レア種の低信頼スコアを抑制 ----------------------------------------
+    try:
+        _tax_df      = pd.read_csv(BASE / "taxonomy.csv").set_index("primary_label")
+        _rare_cls    = {"Amphibia", "Mammalia", "Reptilia"}
+        _rare_count  = 0
+        for _ci, _sp in enumerate(_cols):
+            if _sp in _tax_df.index and _tax_df.loc[_sp, "class_name"] in _rare_cls:
+                _vals = _sub.iloc[:, _ci + 1].to_numpy(np.float32)
+                _thr  = _vals.mean() + 0.05
+                _sub.iloc[:, _ci + 1] = np.where(_vals < _thr, _vals * 0.9, _vals)
+                _rare_count += 1
+        print(f"レア種抑制: {_rare_count} クラスに適用")
+    except Exception as _ex:
+        print(f"レア種抑制スキップ: {_ex}")
+
+    # ---- ドライラン対応 -----------------------------------------------------
+    _test_check = list((BASE / "test_soundscapes").glob("*.ogg"))
+    if not _test_check:
+        _sample_pub = pd.read_csv(BASE / "sample_submission.csv")
+        _tmpl       = _sub[_cols].mean(axis=0).astype(np.float32)
+        _sub        = _sample_pub.copy()
+        for _lbl in _cols:
+            _sub[_lbl] = _tmpl[_lbl]
+        print("ドライラン: sample_submission の行順に揃えました。")
+
+    _sub.to_csv("submission.csv", index=False)
+    print(f"\nsubmission.csv 保存完了  shape={_sub.shape}")
+    print(f"  w_proto={BLEND_W_PROTO:.4f} / w_sed={BLEND_W_SED:.4f}  "
+          f"(旧固定値: 0.60 / 0.40)")
+
+print(f"\nS1 OOF Blend Optimization 完了")
+print(f"総経過時間: {(time.time() - _WALL_START)/60:.1f} min")
+
  
  
