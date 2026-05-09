@@ -1,0 +1,17 @@
+experiment_id: "001"
+seed: 42
+
+paths:
+  kaggle_input_root: "/kaggle/input/competitions/birdclef-2026"
+  kaggle_output_dir: "/kaggle/working/codex_experiment_001"
+  colab_input_root: "/content/drive/MyDrive/birdclef-2026"
+  colab_output_dir: "/content/codex_experiment_001"
+
+runtime:
+  mode: "dry_run"
+  sample_files: 5
+
+birdclef:
+  sample_rate: 32000
+  window_seconds: 5
+  file_seconds: 60
