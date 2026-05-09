@@ -13,6 +13,7 @@ codex-experiments/001/
   colab_runner.py
   cv_blend_gate_runner.py
   blend_cv_gate_cell.py
+  v18_cv_gate_kaggle.ipynb
   src/pipeline.py
   outputs/.gitkeep
 ```
@@ -28,6 +29,22 @@ python codex-experiments/001/kaggle_runner.py
 ```
 
 The runner writes outputs under `/kaggle/working/codex_experiment_001` by default.
+
+## Kaggle Notebook
+
+Use `v18_cv_gate_kaggle.ipynb` when you want the full guided workflow:
+
+1. Clone `codex/experiment-001`.
+2. Force V18 into `MODE = "train"` in the Kaggle working copy.
+3. Run the V18 script with `%run` so notebook variables remain available.
+4. Save `sed_preds_tr_aligned.npy`, `oof_proto_probs.npy`, and `perch_meta.parquet`.
+5. Run the CV blend gate for `w_proto=0.65` vs `w_proto=0.60`.
+
+Notebook path:
+
+```text
+codex-experiments/001/v18_cv_gate_kaggle.ipynb
+```
 
 ## CV Blend Gate
 
