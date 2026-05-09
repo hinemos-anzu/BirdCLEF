@@ -104,11 +104,25 @@ def apply_unmapped_prototype_boost(
 '''
 
 
-def sub_required(pattern: str, repl, text: str, label: str) -> str:
-    text2, count = re.subn(pattern, repl, text, count=1)
-    if count != 1:
-        raise RuntimeError(f"Expected exactly one {label}, found {count}")
-    return text2
+def insert_helper(text: str) -> str:
+    """Insert helper after unmapped/proxy setup using robust anchors."""
+    anchors = [
+        "# ── Cell 5: Perch inference engine",
+        "# -- Cell 5: Perch inference engine",
+        "import concurrent.futures",
+    ]
+    for anchor in anchors:
+        idx = text.find(anchor)
+        if idx >= 0:
+            return text[:idx] + HELPER_CODE + "\n" + text[idx:]
+
+    # Fallback: insert after the proxy target print loop body if present.
+    pattern = r'(for idx, bc_idxs in list\(proxy_map\.items\(\)\)\[:8\]:[\s\S]*?print\(f"\s+\{label:12s\}.*?\n)'
+    text2, count = re.subn(pattern, lambda m: m.group(1) + "\n" + HELPER_CODE + "\n", text, count=1)
+    if count == 1:
+        return text2
+
+    raise RuntimeError("Could not find a robust insertion point for A1 helper")
 
 
 def patch_script(path: Path) -> None:
@@ -117,12 +131,7 @@ def patch_script(path: Path) -> None:
         print(f"A1 patch already present: {path}")
         return
 
-    text = sub_required(
-        r'print\("Species still without signal:\s+", len\(UNMAPPED_POS\) - len\(proxy_map\)\)',
-        lambda m: m.group(0) + "\n" + HELPER_CODE,
-        text,
-        "unmapped helper insertion",
-    )
+    text = insert_helper(text)
 
     old = 'probs_va = adaptive_delta_smooth(probs_va, n_windows=N_WINDOWS, base_alpha=0.20)'
     new = old + '''
