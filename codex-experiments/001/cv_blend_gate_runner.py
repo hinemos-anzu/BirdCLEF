@@ -1,20 +1,16 @@
 """CLI runner for LB-scarce blend-ratio CV gating.
 
-Run this on Kaggle after the V18 notebook/script has generated OOF artifacts.
-It compares a candidate blend weight against the current LB-best baseline
-without spending a Kaggle submission.
+Run after the V18 notebook/script has generated OOF artifacts. The gate compares
+a candidate blend weight against the current LB-best baseline without spending a
+Kaggle submission.
 
-Expected defaults:
+Defaults:
   proto OOF: /kaggle/working/cache/oof_proto_probs.npy
   meta:      /kaggle/working/cache/perch_meta.parquet
   labels:    /kaggle/input/competitions/birdclef-2026/train_soundscapes_labels.csv
   sample:    /kaggle/input/competitions/birdclef-2026/sample_submission.csv
 
-SED predictions are not always saved by the V18 notebook, so pass one of:
-  --sed-oof /path/to/sed_preds_tr_aligned.npy
-  --sed-oof /path/to/sed_preds_tr_aligned.csv
-
-If your notebook currently only has sed_preds_tr_aligned in memory, save it with:
+If SED train predictions only exist as a notebook variable, save them first:
   np.save('/kaggle/working/cache/sed_preds_tr_aligned.npy', sed_preds_tr_aligned)
 """
 
@@ -28,7 +24,6 @@ from typing import Any
 import numpy as np
 import pandas as pd
 from sklearn.metrics import roc_auc_score
-
 
 DEFAULT_INPUT_ROOT = Path("/kaggle/input/competitions/birdclef-2026")
 DEFAULT_CACHE_DIR = Path("/kaggle/working/cache")
@@ -80,15 +75,11 @@ def load_array(path: Path, expected_cols: int | None = None) -> np.ndarray:
         arr = np.load(path).astype(np.float32)
     elif path.suffix == ".npz":
         data = np.load(path)
-        candidates = ["preds", "scores", "oof", "sed_preds", "arr_0"]
-        key = next((k for k in candidates if k in data.files), None)
-        if key is None:
-            key = data.files[0]
+        key = next((k for k in ["preds", "scores", "oof", "sed_preds", "arr_0"] if k in data.files), data.files[0])
         arr = data[key].astype(np.float32)
     elif path.suffix == ".csv":
         df = pd.read_csv(path)
-        cols = [c for c in df.columns if c != "row_id"]
-        arr = df[cols].to_numpy(np.float32)
+        arr = df[[c for c in df.columns if c != "row_id"]].to_numpy(np.float32)
     else:
         raise ValueError(f"Unsupported array file: {path}")
     if arr.ndim != 2:
@@ -101,21 +92,19 @@ def load_array(path: Path, expected_cols: int | None = None) -> np.ndarray:
 def find_sed_path(cache_dir: Path, explicit: Path | None) -> Path:
     if explicit is not None:
         return explicit
-    candidates = [
+    for path in [
         cache_dir / "sed_preds_tr_aligned.npy",
         cache_dir / "sed_oof.npy",
         cache_dir / "oof_sed_probs.npy",
         cache_dir / "sed_preds_tr_aligned.csv",
         Path("/kaggle/working/sed_preds_tr_aligned.npy"),
         Path("/kaggle/working/sed_preds_tr_aligned.csv"),
-    ]
-    for path in candidates:
+    ]:
         if path.exists():
             return path
     raise FileNotFoundError(
-        "SED OOF/train predictions were not found. Pass --sed-oof, or save "
-        "np.save('/kaggle/working/cache/sed_preds_tr_aligned.npy', sed_preds_tr_aligned) "
-        "after Cell 11/12 in the notebook."
+        "SED predictions were not found. Pass --sed-oof, or save "
+        "np.save('/kaggle/working/cache/sed_preds_tr_aligned.npy', sed_preds_tr_aligned)."
     )
 
 
@@ -123,19 +112,12 @@ def union_labels(values: pd.Series) -> list[str]:
     out: set[str] = set()
     for x in values:
         if pd.notna(x):
-            for token in str(x).split(";"):
-                token = token.strip()
-                if token:
-                    out.add(token)
+            out.update(t.strip() for t in str(x).split(";") if t.strip())
     return sorted(out)
 
 
 def build_y_aligned(input_root: Path, meta: pd.DataFrame, primary_labels: list[str]) -> np.ndarray:
     labels_path = input_root / "train_soundscapes_labels.csv"
-    if not labels_path.exists():
-        raise FileNotFoundError(labels_path)
-
-    label_to_idx = {label: i for i, label in enumerate(primary_labels)}
     labels = pd.read_csv(labels_path)
     grouped = (
         labels.groupby(["filename", "start", "end"])["primary_label"]
@@ -145,6 +127,7 @@ def build_y_aligned(input_root: Path, meta: pd.DataFrame, primary_labels: list[s
     grouped["end_sec"] = pd.to_timedelta(grouped["end"]).dt.total_seconds().astype(int)
     grouped["row_id"] = grouped["filename"].str.replace(".ogg", "", regex=False) + "_" + grouped["end_sec"].astype(str)
 
+    label_to_idx = {label: i for i, label in enumerate(primary_labels)}
     y_by_row: dict[str, np.ndarray] = {}
     for row_id, lbls in zip(grouped["row_id"], grouped["label_list"]):
         yy = np.zeros(len(primary_labels), dtype=np.uint8)
@@ -186,16 +169,45 @@ def bootstrap_file_delta(
     file_to_idx = {f: np.where(filenames == f)[0] for f in files}
     cand = blend_ranked(r_proto, r_sed, candidate_w)
     base = blend_ranked(r_proto, r_sed, baseline_w)
-
     deltas: list[float] = []
     for _ in range(n_boot):
-        sampled = rng.choice(files, size=len(files), replace=True)
-        idx = np.concatenate([file_to_idx[f] for f in sampled])
+        idx = np.concatenate([file_to_idx[f] for f in rng.choice(files, size=len(files), replace=True)])
         auc_c = safe_macro_auc(y_true[idx], cand[idx])
         auc_b = safe_macro_auc(y_true[idx], base[idx])
         if np.isfinite(auc_c) and np.isfinite(auc_b):
             deltas.append(auc_c - auc_b)
     return np.asarray(deltas, dtype=np.float32)
+
+
+def calibrate_lb_proxy(df: pd.DataFrame) -> tuple[pd.DataFrame, dict[str, Any]]:
+    cv_050 = float(df.loc[np.isclose(df["w_proto"], 0.50), "cv_auc"].iloc[0])
+    cv_060 = float(df.loc[np.isclose(df["w_proto"], 0.60), "cv_auc"].iloc[0])
+    lb_delta = DEFAULT_KNOWN_LB[0.60] - DEFAULT_KNOWN_LB[0.50]
+    cv_delta = cv_060 - cv_050
+    sign_agrees = np.sign(lb_delta) == np.sign(cv_delta)
+
+    df = df.copy()
+    if sign_agrees and abs(cv_delta) > 1e-8:
+        raw_scale = lb_delta / cv_delta
+        scale = float(np.clip(raw_scale, -2.0, 2.0))
+        df["lb_proxy"] = DEFAULT_KNOWN_LB[0.60] + (df["cv_auc"] - cv_060) * scale
+        df["lb_proxy_delta_vs_060"] = df["lb_proxy"] - DEFAULT_KNOWN_LB[0.60]
+        proxy_usable = True
+    else:
+        raw_scale = float("nan")
+        scale = 0.0
+        df["lb_proxy"] = np.nan
+        df["lb_proxy_delta_vs_060"] = np.nan
+        proxy_usable = False
+
+    return df, {
+        "cv_anchor_delta_060_minus_050": float(cv_delta),
+        "lb_anchor_delta_060_minus_050": float(lb_delta),
+        "cv_lb_anchor_sign_agrees": bool(sign_agrees),
+        "cv_to_lb_scale_raw": float(raw_scale),
+        "cv_to_lb_scale_capped": float(scale),
+        "lb_proxy_usable": bool(proxy_usable),
+    }
 
 
 def run_gate(args: argparse.Namespace) -> tuple[pd.DataFrame, dict[str, Any]]:
@@ -211,11 +223,8 @@ def run_gate(args: argparse.Namespace) -> tuple[pd.DataFrame, dict[str, Any]]:
     proto = load_array(proto_path, expected_cols=n_classes)
     sed = load_array(sed_path, expected_cols=n_classes)
     y_true = build_y_aligned(args.input_root, meta, primary_labels)
-
     if len(meta) != len(proto) or len(meta) != len(sed) or len(meta) != len(y_true):
-        raise ValueError(
-            f"Length mismatch: meta={len(meta)}, proto={len(proto)}, sed={len(sed)}, y={len(y_true)}"
-        )
+        raise ValueError(f"Length mismatch: meta={len(meta)}, proto={len(proto)}, sed={len(sed)}, y={len(y_true)}")
 
     w_grid = np.array([float(x) for x in args.w_grid.split(",")], dtype=np.float32)
     r_proto = rank_cols(np.clip(proto, 1e-5, 1.0 - 1e-5))
@@ -223,26 +232,17 @@ def run_gate(args: argparse.Namespace) -> tuple[pd.DataFrame, dict[str, Any]]:
 
     rows = []
     for w in w_grid:
-        pred = blend_ranked(r_proto, r_sed, float(w))
-        rows.append({"w_proto": float(w), "w_sed": float(1.0 - w), "cv_auc": safe_macro_auc(y_true, pred)})
+        rows.append({"w_proto": float(w), "w_sed": float(1.0 - w), "cv_auc": safe_macro_auc(y_true, blend_ranked(r_proto, r_sed, float(w)))})
     df = pd.DataFrame(rows)
-
     base_cv = float(df.loc[np.isclose(df["w_proto"], args.baseline_w), "cv_auc"].iloc[0])
     df["cv_delta_vs_baseline"] = df["cv_auc"] - base_cv
+    df, calibration = calibrate_lb_proxy(df)
 
-    cv_050 = float(df.loc[np.isclose(df["w_proto"], 0.50), "cv_auc"].iloc[0])
-    cv_060 = float(df.loc[np.isclose(df["w_proto"], 0.60), "cv_auc"].iloc[0])
-    raw_scale = (DEFAULT_KNOWN_LB[0.60] - DEFAULT_KNOWN_LB[0.50]) / max(cv_060 - cv_050, 1e-8)
-    scale = float(np.clip(raw_scale, -2.0, 2.0))
-    df["lb_proxy"] = DEFAULT_KNOWN_LB[0.60] + (df["cv_auc"] - cv_060) * scale
-    df["lb_proxy_delta_vs_060"] = df["lb_proxy"] - DEFAULT_KNOWN_LB[0.60]
-
-    filenames = meta["filename"].astype(str).to_numpy()
     boot_delta = bootstrap_file_delta(
         r_proto,
         r_sed,
         y_true,
-        filenames,
+        meta["filename"].astype(str).to_numpy(),
         candidate_w=args.candidate_w,
         baseline_w=args.baseline_w,
         n_boot=args.n_boot,
@@ -251,11 +251,16 @@ def run_gate(args: argparse.Namespace) -> tuple[pd.DataFrame, dict[str, Any]]:
     p_win = float((boot_delta > 0).mean()) if len(boot_delta) else float("nan")
     delta_mean = float(np.nanmean(boot_delta)) if len(boot_delta) else float("nan")
     ci_low, ci_high = np.nanpercentile(boot_delta, [5, 95]) if len(boot_delta) else (float("nan"), float("nan"))
-
     cand_row = df.loc[np.isclose(df["w_proto"], args.candidate_w)].iloc[0]
-    proxy_gain = float(cand_row["lb_proxy_delta_vs_060"])
-    should_submit = bool((proxy_gain >= args.min_lb_gain) and (p_win >= args.min_boot_prob))
 
+    if calibration["lb_proxy_usable"]:
+        proxy_gain = float(cand_row["lb_proxy_delta_vs_060"])
+        proxy_pass = proxy_gain >= args.min_lb_gain
+    else:
+        proxy_gain = float("nan")
+        proxy_pass = True
+
+    should_submit = bool(proxy_pass and (p_win >= args.min_boot_prob) and (delta_mean > 0.0))
     decision = {
         "proto_path": str(proto_path),
         "sed_path": str(sed_path),
@@ -263,8 +268,7 @@ def run_gate(args: argparse.Namespace) -> tuple[pd.DataFrame, dict[str, Any]]:
         "known_lb": DEFAULT_KNOWN_LB,
         "candidate_w": float(args.candidate_w),
         "baseline_w": float(args.baseline_w),
-        "cv_to_lb_scale_raw": float(raw_scale),
-        "cv_to_lb_scale_capped": float(scale),
+        **calibration,
         "candidate_lb_proxy_gain": proxy_gain,
         "bootstrap_mean_delta": delta_mean,
         "bootstrap_p_win": p_win,
@@ -280,7 +284,6 @@ def main() -> None:
     args = parse_args()
     args.output_dir.mkdir(parents=True, exist_ok=True)
     table, decision = run_gate(args)
-
     table_path = args.output_dir / "blend_cv_gate_table.csv"
     decision_path = args.output_dir / "blend_cv_gate_decision.json"
     table.to_csv(table_path, index=False)
@@ -294,12 +297,14 @@ def main() -> None:
         "w_sed": "{:.2f}".format,
         "cv_auc": "{:.6f}".format,
         "cv_delta_vs_baseline": "{:+.6f}".format,
-        "lb_proxy": "{:.6f}".format,
-        "lb_proxy_delta_vs_060": "{:+.6f}".format,
+        "lb_proxy": lambda x: "NA" if pd.isna(x) else f"{x:.6f}",
+        "lb_proxy_delta_vs_060": lambda x: "NA" if pd.isna(x) else f"{x:+.6f}",
     }))
     print("\nDecision summary:")
     for key, value in decision.items():
         print(f"  {key}: {value}")
+    if not decision["lb_proxy_usable"]:
+        print("\nNote: CV and known LB anchors disagree in direction, so lb_proxy is disabled and bootstrap is the primary gate.")
     if decision["should_submit"]:
         print("\nDecision: Submit candidate is locally justified if this is the highest-priority test.")
     else:
