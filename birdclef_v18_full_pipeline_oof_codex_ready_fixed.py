@@ -1806,13 +1806,17 @@ test_hour_ids = np.array([
     int(meta_te.loc[meta_te["filename"]==fn,"hour_utc"].iloc[0]) % 24
     for fn in test_fnames], dtype=np.int64)
 
-# ── 2-A: TTA on test (5 circular shifts, same as training side) ────────
-proto_out = run_tta_proto(
-    proto_model, emb_te_f, sc_te_f,
-    site_t=torch.tensor(test_site_ids, dtype=torch.long),
-    hour_t=torch.tensor(test_hour_ids, dtype=torch.long),
-    shifts=[0, 1, -1, 2, -2],
-)
+# ── Step B: ProtoSSM on TEST (single-pass, no TTA) ─────────────────────
+# TTA on test was tried (LB 0.939) but hurt vs no-TTA (LB 0.946).
+# TTA is kept only on the training side for ResidualSSM calibration (Step F).
+proto_model.eval()
+with torch.no_grad():
+    proto_out = proto_model(
+        torch.tensor(emb_te_f, dtype=torch.float32),
+        torch.tensor(sc_te_f,  dtype=torch.float32),
+        site_ids=torch.tensor(test_site_ids, dtype=torch.long),
+        hours   =torch.tensor(test_hour_ids, dtype=torch.long),
+    ).numpy()
 proto_scores_flat = proto_out.reshape(-1, N_CLASSES).astype(np.float32)
 
 # ── Step C: Prior tables ───────────────────────────────────────────────
@@ -2422,16 +2426,14 @@ else:
 print("\nCell 12 完了")
 
 # ── ブレンド比率 手動上書き（LB実験用） ────────────────────────────────────
-# OOF最適化の結果を無視して任意の比率で提出したい場合にコメントを外す。
-# ── LB 実験ログ（TTA なし） ────────────────────────────────────────────
+# LB 実験ログ（全て TTA なし）
 # Submit A: BLEND_W_PROTO = 1.00  (w_sed=0.00)  LB: 0.927
 # Submit B: BLEND_W_PROTO = 0.50  (w_sed=0.50)  LB: 0.941
 # [元設定]: BLEND_W_PROTO = 0.60  (w_sed=0.40)  LB: 0.946  ← 現在のベスト
-# Submit C: BLEND_W_PROTO = 0.65  (w_sed=0.35)  LB: ?      ← 今回
+# w_proto=0.60 TTA あり:                         LB: 0.939  ← TTA は逆効果と確定
+# Submit C: BLEND_W_PROTO = 0.65  (w_sed=0.35)  LB: ?      ← 今回（TTA なし）
 # Submit D: BLEND_W_PROTO = 0.70  (w_sed=0.30)  LB: ?      ← C>0.946 なら
-# ── TTA あり（比率確定後に試す） ────────────────────────────────────────
-# Submit E: BLEND_W_PROTO = best  (TTA on)       LB: ?
-BLEND_W_PROTO = 0.65   # ← Submit C: w_sed=0.35
+BLEND_W_PROTO = 0.65   # ← Submit C: w_sed=0.35 / TTA なし
 BLEND_W_SED   = 1.0 - BLEND_W_PROTO
 print(f"[手動上書き] w_proto={BLEND_W_PROTO:.2f} / w_sed={BLEND_W_SED:.2f}")
 
