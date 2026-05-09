@@ -1,9 +1,7 @@
 """Patch V18 script with A2 classwise ResidualSSM correction weights.
 
-This edits only the Kaggle working copy of
-birdclef_v18_full_pipeline_oof_codex_ready_fixed.py. The patch is idempotent
-and uses regex anchors around ResidualSSM blocks so it tolerates formatting
-changes in the V18 script.
+Edits only the Kaggle working copy of birdclef_v18_full_pipeline_oof_codex_ready_fixed.py.
+The patch is idempotent and uses balanced-parenthesis matching for train_residual_ssm calls.
 """
 
 from __future__ import annotations
@@ -35,30 +33,25 @@ def learn_classwise_correction_weights(
     weights = np.full(N_CLASSES, float(base_weight), dtype=np.float32)
     tuned = 0
     moved = 0
-
     for c in range(N_CLASSES):
         y = Y_full[:, c]
         pos = int(y.sum())
         neg = int(len(y) - pos)
         if pos < min_pos or neg < min_pos:
             continue
-
         base_scores = first_pass_flat[:, c]
         corr_scores = correction_flat[:, c]
         best_w = float(base_weight)
         best_auc = roc_auc_score(y, base_scores + float(base_weight) * corr_scores)
-
         for w in grid:
             auc = roc_auc_score(y, base_scores + float(w) * corr_scores)
             if auc > best_auc + 1e-6:
                 best_auc = float(auc)
                 best_w = float(w)
-
         weights[c] = float(base_weight + shrink * (best_w - base_weight))
         tuned += 1
         if abs(best_w - base_weight) > 1e-6:
             moved += 1
-
     weights = np.clip(weights, 0.0, 0.60).astype(np.float32)
     if verbose:
         print(
@@ -124,11 +117,63 @@ OOF_A2 = r'''
 '''
 
 
-def sub_once(pattern: str, repl: str, text: str, label: str, flags: int = 0) -> str:
-    text2, count = re.subn(pattern, repl, text, count=1, flags=flags)
+def find_call_end(text: str, open_paren: int) -> int:
+    depth = 0
+    in_str: str | None = None
+    escape = False
+    for i in range(open_paren, len(text)):
+        ch = text[i]
+        if in_str:
+            if escape:
+                escape = False
+            elif ch == "\\":
+                escape = True
+            elif ch == in_str:
+                in_str = None
+            continue
+        if ch in {"'", '"'}:
+            in_str = ch
+        elif ch == "(":
+            depth += 1
+        elif ch == ")":
+            depth -= 1
+            if depth == 0:
+                return i + 1
+    raise RuntimeError("Unbalanced train_residual_ssm call")
+
+
+def find_train_call(text: str, required_tokens: list[str]) -> tuple[int, int] | None:
+    needle = "res_model, correction_weight = train_residual_ssm("
+    pos = 0
+    while True:
+        start = text.find(needle, pos)
+        if start < 0:
+            return None
+        open_paren = text.find("(", start)
+        end = find_call_end(text, open_paren)
+        block = text[start:end]
+        compact = re.sub(r"\s+", "", block)
+        if all(token in compact for token in required_tokens):
+            return start, end
+        pos = end
+
+
+def sub_once(pattern: str, repl: str, text: str, label: str) -> str:
+    text2, count = re.subn(pattern, repl, text, count=1)
     if count != 1:
         raise RuntimeError(f"Expected exactly one {label}, found {count}")
     return text2
+
+
+def insert_after_call(text: str, required_tokens: list[str], insertion: str, label: str, required: bool) -> tuple[str, bool]:
+    found = find_train_call(text, required_tokens)
+    if found is None:
+        if required:
+            raise RuntimeError(f"Could not find {label}")
+        print(f"WARNING: could not find {label}; skipping that insertion")
+        return text, False
+    _, end = found
+    return text[:end] + insertion + text[end:], True
 
 
 def patch_script(path: Path) -> None:
@@ -138,36 +183,37 @@ def patch_script(path: Path) -> None:
         return
 
     text = sub_once(
-        r'(print\("✅ ResidualSSM defined \(~439K params, ~20s training\)"\))',
-        lambda m: m.group(1) + "\n" + HELPER_CODE,
+        r'print\("✅ ResidualSSM defined \(~439K params, ~20s training\)"\)',
+        lambda m: m.group(0) + "\n" + HELPER_CODE,
         text,
         "ResidualSSM helper insertion",
     )
 
-    full_pattern = (
-        r'(res_model, correction_weight = train_residual_ssm\(\n'
-        r'(?:(?!\n\)).)*?emb_full=emb_tr,\n'
-        r'(?:(?!\n\)).)*?first_pass_flat=first_pass,\n'
-        r'(?:(?!\n\)).)*?Y_full=Y_FULL_aligned,\n'
-        r'(?:(?!\n\)).)*?\n\))'
-    )
-    text = sub_once(full_pattern, lambda m: m.group(1) + FULL_A2, text, "full-train ResidualSSM block", re.S)
-
-    oof_pattern = (
-        r'(res_model, correction_weight = train_residual_ssm\(\n'
-        r'(?:(?!\n        \)).)*?emb_full=emb_tr_f,\n'
-        r'(?:(?!\n        \)).)*?first_pass_flat=first_pass_tr_f,\n'
-        r'(?:(?!\n        \)).)*?Y_full=Y_tr_f,\n'
-        r'(?:(?!\n        \)).)*?\n        \))'
-    )
-    text = sub_once(oof_pattern, lambda m: m.group(1) + OOF_A2, text, "OOF ResidualSSM block", re.S)
-
-    text = sub_once(
-        r'final_scores\s*=\s*first_pass\s*\+\s*correction_weight\s*\*\s*correction',
-        'final_scores = apply_classwise_correction(first_pass, correction, correction_weight)',
+    text, full_inserted = insert_after_call(
         text,
-        "full correction application",
+        ["emb_full=emb_tr", "first_pass_flat=first_pass", "Y_full=Y_FULL_aligned"],
+        FULL_A2,
+        "full-train ResidualSSM block",
+        required=False,
     )
+    text, _ = insert_after_call(
+        text,
+        ["emb_full=emb_tr_f", "first_pass_flat=first_pass_tr_f", "Y_full=Y_tr_f"],
+        OOF_A2,
+        "OOF ResidualSSM block",
+        required=True,
+    )
+
+    if full_inserted:
+        text = sub_once(
+            r'final_scores\s*=\s*first_pass\s*\+\s*correction_weight\s*\*\s*correction',
+            'final_scores = apply_classwise_correction(first_pass, correction, correction_weight)',
+            text,
+            "full correction application",
+        )
+    else:
+        print("WARNING: full-train A2 not inserted; submission path keeps scalar correction_weight")
+
     text = sub_once(
         r'final_va\s*=\s*first_pass_va\s*\+\s*correction_weight\s*\*\s*va_correction',
         'final_va = apply_classwise_correction(first_pass_va, va_correction, correction_weight)',
