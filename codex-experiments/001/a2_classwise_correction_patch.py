@@ -1,7 +1,8 @@
 """Patch V18 script with A2 classwise ResidualSSM correction weights.
 
 Edits only the Kaggle working copy of birdclef_v18_full_pipeline_oof_codex_ready_fixed.py.
-The patch is idempotent and prioritizes the OOF path used for CV evaluation.
+This patch intentionally modifies only the OOF/CV path. The full-train submission
+path stays scalar until A2 is validated by CV.
 """
 
 from __future__ import annotations
@@ -70,29 +71,6 @@ def apply_classwise_correction(first_pass_flat, correction_flat, correction_weig
 # /A2_CLASSWISE_CORRECTION_WEIGHTS
 '''
 
-FULL_A2 = r'''
-
-# A2: learn classwise correction weights on full training data.
-res_model.eval()
-with torch.no_grad():
-    train_correction = res_model(
-        torch.tensor(emb_tr.reshape(n_files, N_WINDOWS, -1), dtype=torch.float32),
-        torch.tensor(first_pass.reshape(n_files, N_WINDOWS, -1), dtype=torch.float32),
-        site_ids=torch.tensor(site_ids, dtype=torch.long),
-        hours=torch.tensor(hour_ids, dtype=torch.long),
-    ).numpy().reshape(-1, N_CLASSES)
-
-correction_weight = learn_classwise_correction_weights(
-    first_pass_flat=first_pass,
-    correction_flat=train_correction,
-    Y_full=Y_FULL_aligned,
-    base_weight=correction_weight,
-    min_pos=3,
-    shrink=0.50,
-    verbose=True,
-)
-'''
-
 OOF_A2 = r'''
 
         # A2: learn classwise correction weights on this training fold.
@@ -112,7 +90,7 @@ OOF_A2 = r'''
             base_weight=correction_weight,
             min_pos=3,
             shrink=0.50,
-            verbose=False,
+            verbose=True,
         )
 '''
 
@@ -151,39 +129,17 @@ def find_train_call(text: str, required_tokens: list[str]) -> tuple[int, int] | 
             return None
         open_paren = text.find("(", start)
         end = find_call_end(text, open_paren)
-        block = text[start:end]
-        compact = re.sub(r"\s+", "", block)
+        compact = re.sub(r"\s+", "", text[start:end])
         if all(token in compact for token in required_tokens):
             return start, end
         pos = end
 
 
-def sub_optional(pattern: str, repl: str, text: str, label: str) -> tuple[str, bool]:
+def sub_required(pattern: str, repl, text: str, label: str) -> str:
     text2, count = re.subn(pattern, repl, text, count=1)
-    if count == 0:
-        print(f"WARNING: could not find {label}; skipping")
-        return text, False
     if count != 1:
-        raise RuntimeError(f"Expected at most one {label}, found {count}")
-    return text2, True
-
-
-def sub_required(pattern: str, repl: str, text: str, label: str) -> str:
-    text2, ok = sub_optional(pattern, repl, text, label)
-    if not ok:
-        raise RuntimeError(f"Could not find required {label}")
+        raise RuntimeError(f"Expected exactly one {label}, found {count}")
     return text2
-
-
-def insert_after_call(text: str, required_tokens: list[str], insertion: str, label: str, required: bool) -> tuple[str, bool]:
-    found = find_train_call(text, required_tokens)
-    if found is None:
-        if required:
-            raise RuntimeError(f"Could not find {label}")
-        print(f"WARNING: could not find {label}; skipping that insertion")
-        return text, False
-    _, end = found
-    return text[:end] + insertion + text[end:], True
 
 
 def patch_script(path: Path) -> None:
@@ -199,32 +155,14 @@ def patch_script(path: Path) -> None:
         "ResidualSSM helper insertion",
     )
 
-    text, full_inserted = insert_after_call(
-        text,
-        ["emb_full=emb_tr", "first_pass_flat=first_pass", "Y_full=Y_FULL_aligned"],
-        FULL_A2,
-        "full-train ResidualSSM block",
-        required=False,
-    )
-    text, _ = insert_after_call(
+    found = find_train_call(
         text,
         ["emb_full=emb_tr_f", "first_pass_flat=first_pass_tr_f", "Y_full=Y_tr_f"],
-        OOF_A2,
-        "OOF ResidualSSM block",
-        required=True,
     )
-
-    if full_inserted:
-        text, full_apply = sub_optional(
-            r'final_scores\s*=\s*first_pass\s*\+\s*correction_weight\s*\*\s*correction',
-            'final_scores = apply_classwise_correction(first_pass, correction, correction_weight)',
-            text,
-            "full correction application",
-        )
-        if not full_apply:
-            print("WARNING: full-train insertion exists but submission application line was not changed")
-    else:
-        print("WARNING: full-train A2 not inserted; submission path keeps scalar correction_weight")
+    if found is None:
+        raise RuntimeError("Could not find OOF ResidualSSM block")
+    _, end = found
+    text = text[:end] + OOF_A2 + text[end:]
 
     text = sub_required(
         r'final_va\s*=\s*first_pass_va\s*\+\s*correction_weight\s*\*\s*va_correction',
@@ -234,7 +172,7 @@ def patch_script(path: Path) -> None:
     )
 
     path.write_text(text, encoding="utf-8")
-    print(f"A2 patch applied: {path}")
+    print(f"A2 OOF-only patch applied: {path}")
 
 
 def main() -> None:
