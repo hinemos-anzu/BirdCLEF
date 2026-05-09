@@ -13,6 +13,7 @@ codex-experiments/001/
   colab_runner.py
   cv_blend_gate_runner.py
   blend_cv_gate_cell.py
+  a1_unmapped_prototype_patch.py
   a2_classwise_correction_patch.py
   v18_cv_gate_kaggle.ipynb
   src/pipeline.py
@@ -29,38 +30,42 @@ codex-experiments/001/
 python codex-experiments/001/kaggle_runner.py
 ```
 
-The runner writes outputs under `/kaggle/working/codex_experiment_001` by default.
+## A1 Unmapped Prototype Boost
 
-## A2 Classwise Correction
+A1 targets the 28 classes with no direct Perch logit and no genus proxy. It learns simple positive-vs-negative embedding prototypes on each OOF training fold, then conservatively boosts only the high-confidence validation tail for those unmapped classes.
 
-A2 replaces the scalar ResidualSSM `correction_weight` with classwise correction weights learned on the training fold. It keeps the original scalar value as a prior and shrinks per-class weights toward it to reduce overfit.
-
-In Kaggle, run this after clone and after forcing `MODE = "train"`, but before `%run` executes the V18 script:
+Evaluate A1 by itself first. Do not combine A1 and A2 until each one has been measured independently.
 
 ```bash
-python /kaggle/working/BirdCLEF/codex-experiments/001/a2_classwise_correction_patch.py \
+rm -rf /kaggle/working/BirdCLEF
+ git clone -b codex/experiment-001 https://github.com/hinemos-anzu/BirdCLEF.git /kaggle/working/BirdCLEF
+python /kaggle/working/BirdCLEF/codex-experiments/001/a1_unmapped_prototype_patch.py \
   --script /kaggle/working/BirdCLEF/birdclef_v18_full_pipeline_oof_codex_ready_fixed.py
+rm -f /kaggle/working/cache/oof_proto_probs.npy
 ```
 
-Expected output:
-
-```text
-A2 patch applied: /kaggle/working/BirdCLEF/birdclef_v18_full_pipeline_oof_codex_ready_fixed.py
-```
-
-Then run V18 normally:
+Then run:
 
 ```python
 %run /kaggle/working/BirdCLEF/birdclef_v18_full_pipeline_oof_codex_ready_fixed.py
 ```
 
-The log should include:
+Expected A1 log inside OOF:
 
 ```text
-A2 classwise correction weights: tuned=... classes, moved=..., mean=..., range=[..., ...]
+A1 unmapped prototype boost: target=28 classes, tuned=..., boosted_cells=..., blend=0.35, q_gate=0.70
 ```
 
-The patcher is idempotent. If it has already been applied, it prints `A2 patch already present` and leaves the script unchanged.
+Compare `[ProtoSSM OOF v2] 全体 AUC` against the current no-A1 baseline around `0.9505`. Treat improvements below about `+0.001` as noise.
+
+## A2 Classwise Correction
+
+A2 replaces the scalar ResidualSSM `correction_weight` with classwise correction weights learned on the training fold. A2 was tested as OOF-only and did not improve enough to justify LB by itself.
+
+```bash
+python /kaggle/working/BirdCLEF/codex-experiments/001/a2_classwise_correction_patch.py \
+  --script /kaggle/working/BirdCLEF/birdclef_v18_full_pipeline_oof_codex_ready_fixed.py
+```
 
 ## Kaggle Notebook
 
@@ -68,7 +73,7 @@ Use `v18_cv_gate_kaggle.ipynb` when you want the full guided workflow:
 
 1. Clone `codex/experiment-001`.
 2. Force V18 into `MODE = "train"` in the Kaggle working copy.
-3. Optionally apply A2 with `a2_classwise_correction_patch.py` before `%run`.
+3. Optionally apply one patcher before `%run`.
 4. Run the V18 script with `%run` so notebook variables remain available.
 5. Save `sed_preds_tr_aligned.npy`, `oof_proto_probs.npy`, and `perch_meta.parquet`.
 6. Run the CV blend gate for `w_proto=0.65` vs `w_proto=0.60`.
@@ -83,20 +88,9 @@ codex-experiments/001/v18_cv_gate_kaggle.ipynb
 
 Use this to decide whether a limited LB submission is worth spending.
 
-First run the V18 notebook/script far enough to produce these artifacts:
-
-```text
-/kaggle/working/cache/oof_proto_probs.npy
-/kaggle/working/cache/perch_meta.parquet
-```
-
-The SED train predictions may only exist as an in-memory notebook variable. If so, run this one line after Cell 11/12:
-
 ```python
 np.save('/kaggle/working/cache/sed_preds_tr_aligned.npy', sed_preds_tr_aligned)
 ```
-
-Then run:
 
 ```bash
 python BirdCLEF/codex-experiments/001/cv_blend_gate_runner.py \
