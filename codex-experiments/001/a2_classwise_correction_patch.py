@@ -1,7 +1,7 @@
 """Patch V18 script with A2 classwise ResidualSSM correction weights.
 
 Edits only the Kaggle working copy of birdclef_v18_full_pipeline_oof_codex_ready_fixed.py.
-The patch is idempotent and uses balanced-parenthesis matching for train_residual_ssm calls.
+The patch is idempotent and prioritizes the OOF path used for CV evaluation.
 """
 
 from __future__ import annotations
@@ -158,10 +158,20 @@ def find_train_call(text: str, required_tokens: list[str]) -> tuple[int, int] | 
         pos = end
 
 
-def sub_once(pattern: str, repl: str, text: str, label: str) -> str:
+def sub_optional(pattern: str, repl: str, text: str, label: str) -> tuple[str, bool]:
     text2, count = re.subn(pattern, repl, text, count=1)
+    if count == 0:
+        print(f"WARNING: could not find {label}; skipping")
+        return text, False
     if count != 1:
-        raise RuntimeError(f"Expected exactly one {label}, found {count}")
+        raise RuntimeError(f"Expected at most one {label}, found {count}")
+    return text2, True
+
+
+def sub_required(pattern: str, repl: str, text: str, label: str) -> str:
+    text2, ok = sub_optional(pattern, repl, text, label)
+    if not ok:
+        raise RuntimeError(f"Could not find required {label}")
     return text2
 
 
@@ -182,7 +192,7 @@ def patch_script(path: Path) -> None:
         print(f"A2 patch already present: {path}")
         return
 
-    text = sub_once(
+    text = sub_required(
         r'print\("✅ ResidualSSM defined \(~439K params, ~20s training\)"\)',
         lambda m: m.group(0) + "\n" + HELPER_CODE,
         text,
@@ -205,16 +215,18 @@ def patch_script(path: Path) -> None:
     )
 
     if full_inserted:
-        text = sub_once(
+        text, full_apply = sub_optional(
             r'final_scores\s*=\s*first_pass\s*\+\s*correction_weight\s*\*\s*correction',
             'final_scores = apply_classwise_correction(first_pass, correction, correction_weight)',
             text,
             "full correction application",
         )
+        if not full_apply:
+            print("WARNING: full-train insertion exists but submission application line was not changed")
     else:
         print("WARNING: full-train A2 not inserted; submission path keeps scalar correction_weight")
 
-    text = sub_once(
+    text = sub_required(
         r'final_va\s*=\s*first_pass_va\s*\+\s*correction_weight\s*\*\s*va_correction',
         'final_va = apply_classwise_correction(first_pass_va, va_correction, correction_weight)',
         text,
