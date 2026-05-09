@@ -1,23 +1,21 @@
 """Patch V18 script with A2 classwise ResidualSSM correction weights.
 
-This patcher edits the Kaggle working copy of
-birdclef_v18_full_pipeline_oof_codex_ready_fixed.py. It is intentionally
-idempotent and keeps the original scalar correction path as a fallback.
-
-Usage on Kaggle:
-  python BirdCLEF/codex-experiments/001/a2_classwise_correction_patch.py \
-    --script /kaggle/working/BirdCLEF/birdclef_v18_full_pipeline_oof_codex_ready_fixed.py
+This edits only the Kaggle working copy of
+birdclef_v18_full_pipeline_oof_codex_ready_fixed.py. The patch is idempotent
+and uses regex anchors around ResidualSSM blocks so it tolerates formatting
+changes in the V18 script.
 """
 
 from __future__ import annotations
 
 import argparse
+import re
 from pathlib import Path
 
 MARKER = "A2_CLASSWISE_CORRECTION_WEIGHTS"
 
 HELPER_CODE = r'''
-# ── A2: Classwise ResidualSSM correction weights ─────────────────────────────
+# A2_CLASSWISE_CORRECTION_WEIGHTS
 def learn_classwise_correction_weights(
     first_pass_flat,
     correction_flat,
@@ -28,22 +26,15 @@ def learn_classwise_correction_weights(
     shrink=0.50,
     verbose=True,
 ):
-    """
-    Learn one ResidualSSM correction weight per class on the training fold.
-
-    The scalar correction_weight is kept as the prior. For classes with enough
-    positives and negatives, choose the best weight on a small AUC grid, then
-    shrink toward base_weight to reduce fold overfit. Classes without enough
-    support keep base_weight.
-    """
+    """Learn one ResidualSSM correction weight per class."""
     if grid is None:
         grid = np.array([0.00, 0.10, 0.20, 0.30, 0.40, 0.50], dtype=np.float32)
     else:
         grid = np.asarray(grid, dtype=np.float32)
 
     weights = np.full(N_CLASSES, float(base_weight), dtype=np.float32)
-    selected = 0
-    improved = 0
+    tuned = 0
+    moved = 0
 
     for c in range(N_CLASSES):
         y = Y_full[:, c]
@@ -54,9 +45,8 @@ def learn_classwise_correction_weights(
 
         base_scores = first_pass_flat[:, c]
         corr_scores = correction_flat[:, c]
-        base_auc = roc_auc_score(y, base_scores + float(base_weight) * corr_scores)
         best_w = float(base_weight)
-        best_auc = float(base_auc)
+        best_auc = roc_auc_score(y, base_scores + float(base_weight) * corr_scores)
 
         for w in grid:
             auc = roc_auc_score(y, base_scores + float(w) * corr_scores)
@@ -65,72 +55,31 @@ def learn_classwise_correction_weights(
                 best_w = float(w)
 
         weights[c] = float(base_weight + shrink * (best_w - base_weight))
-        selected += 1
+        tuned += 1
         if abs(best_w - base_weight) > 1e-6:
-            improved += 1
+            moved += 1
 
     weights = np.clip(weights, 0.0, 0.60).astype(np.float32)
     if verbose:
         print(
-            f"A2 classwise correction weights: tuned={selected} classes, "
-            f"moved={improved}, mean={weights.mean():.3f}, "
+            f"A2 classwise correction weights: tuned={tuned} classes, "
+            f"moved={moved}, mean={weights.mean():.3f}, "
             f"range=[{weights.min():.2f}, {weights.max():.2f}]"
         )
     return weights
 
 
 def apply_classwise_correction(first_pass_flat, correction_flat, correction_weights):
-    """Apply classwise ResidualSSM correction weights with broadcasting."""
     cw = np.asarray(correction_weights, dtype=np.float32)
     if cw.ndim == 0:
         return first_pass_flat + float(cw) * correction_flat
     return first_pass_flat + cw[None, :] * correction_flat
-# ── /A2_CLASSWISE_CORRECTION_WEIGHTS ─────────────────────────────────────────
+# /A2_CLASSWISE_CORRECTION_WEIGHTS
 '''
 
+FULL_A2 = r'''
 
-def replace_once(text: str, old: str, new: str, label: str) -> str:
-    count = text.count(old)
-    if count != 1:
-        raise RuntimeError(f"Expected exactly one {label}, found {count}")
-    return text.replace(old, new, 1)
-
-
-def patch_script(path: Path) -> None:
-    text = path.read_text(encoding="utf-8")
-    if MARKER in text:
-        print(f"A2 patch already present: {path}")
-        return
-
-    insert_after = 'print("✅ ResidualSSM defined (~439K params, ~20s training)")'
-    text = replace_once(text, insert_after, insert_after + "\n" + HELPER_CODE, "ResidualSSM marker")
-
-    # Full-train/test path: train_residual_ssm currently returns scalar correction_weight.
-    old_full = '''res_model, correction_weight = train_residual_ssm(
-    emb_full=emb_tr,
-    first_pass_flat=first_pass,
-    Y_full=Y_FULL_aligned,
-    site_ids=site_ids,
-    hour_ids=hour_ids,
-    n_epochs=CFG["residual_ssm"]["n_epochs"],
-    patience=CFG["residual_ssm"]["patience"],
-    lr=CFG["residual_ssm"]["lr"],
-    correction_weight=CFG["residual_ssm"]["correction_weight"],
-    verbose=CFG["verbose"],
-)'''
-    new_full = '''res_model, correction_weight = train_residual_ssm(
-    emb_full=emb_tr,
-    first_pass_flat=first_pass,
-    Y_full=Y_FULL_aligned,
-    site_ids=site_ids,
-    hour_ids=hour_ids,
-    n_epochs=CFG["residual_ssm"]["n_epochs"],
-    patience=CFG["residual_ssm"]["patience"],
-    lr=CFG["residual_ssm"]["lr"],
-    correction_weight=CFG["residual_ssm"]["correction_weight"],
-    verbose=CFG["verbose"],
-)
-
+# A2: learn classwise correction weights on full training data.
 res_model.eval()
 with torch.no_grad():
     train_correction = res_model(
@@ -148,32 +97,12 @@ correction_weight = learn_classwise_correction_weights(
     min_pos=3,
     shrink=0.50,
     verbose=True,
-)'''
-    text = replace_once(text, old_full, new_full, "full-train ResidualSSM block")
+)
+'''
 
-    old_apply_full = '''final_scores = first_pass + correction_weight * correction'''
-    new_apply_full = '''final_scores = apply_classwise_correction(first_pass, correction, correction_weight)'''
-    text = replace_once(text, old_apply_full, new_apply_full, "full correction application")
+OOF_A2 = r'''
 
-    old_oof_train = '''res_model, correction_weight = train_residual_ssm(
-            emb_full=emb_tr_f,
-            first_pass_flat=first_pass_tr_f,
-            Y_full=Y_tr_f,
-            site_ids=tr_site_ids_f,
-            hour_ids=tr_hour_ids_f,
-            n_epochs=res_n_epochs, patience=res_patience,
-            lr=1e-3, correction_weight=0.30, verbose=False,
-        )'''
-    new_oof_train = '''res_model, correction_weight = train_residual_ssm(
-            emb_full=emb_tr_f,
-            first_pass_flat=first_pass_tr_f,
-            Y_full=Y_tr_f,
-            site_ids=tr_site_ids_f,
-            hour_ids=tr_hour_ids_f,
-            n_epochs=res_n_epochs, patience=res_patience,
-            lr=1e-3, correction_weight=0.30, verbose=False,
-        )
-
+        # A2: learn classwise correction weights on this training fold.
         res_model.eval()
         with torch.no_grad():
             tr_correction_f = res_model(
@@ -191,12 +120,60 @@ correction_weight = learn_classwise_correction_weights(
             min_pos=3,
             shrink=0.50,
             verbose=False,
-        )'''
-    text = replace_once(text, old_oof_train, new_oof_train, "OOF ResidualSSM block")
+        )
+'''
 
-    old_oof_apply = '''final_va = first_pass_va + correction_weight * va_correction'''
-    new_oof_apply = '''final_va = apply_classwise_correction(first_pass_va, va_correction, correction_weight)'''
-    text = replace_once(text, old_oof_apply, new_oof_apply, "OOF correction application")
+
+def sub_once(pattern: str, repl: str, text: str, label: str, flags: int = 0) -> str:
+    text2, count = re.subn(pattern, repl, text, count=1, flags=flags)
+    if count != 1:
+        raise RuntimeError(f"Expected exactly one {label}, found {count}")
+    return text2
+
+
+def patch_script(path: Path) -> None:
+    text = path.read_text(encoding="utf-8")
+    if MARKER in text:
+        print(f"A2 patch already present: {path}")
+        return
+
+    text = sub_once(
+        r'(print\("✅ ResidualSSM defined \(~439K params, ~20s training\)"\))',
+        lambda m: m.group(1) + "\n" + HELPER_CODE,
+        text,
+        "ResidualSSM helper insertion",
+    )
+
+    full_pattern = (
+        r'(res_model, correction_weight = train_residual_ssm\(\n'
+        r'(?:(?!\n\)).)*?emb_full=emb_tr,\n'
+        r'(?:(?!\n\)).)*?first_pass_flat=first_pass,\n'
+        r'(?:(?!\n\)).)*?Y_full=Y_FULL_aligned,\n'
+        r'(?:(?!\n\)).)*?\n\))'
+    )
+    text = sub_once(full_pattern, lambda m: m.group(1) + FULL_A2, text, "full-train ResidualSSM block", re.S)
+
+    oof_pattern = (
+        r'(res_model, correction_weight = train_residual_ssm\(\n'
+        r'(?:(?!\n        \)).)*?emb_full=emb_tr_f,\n'
+        r'(?:(?!\n        \)).)*?first_pass_flat=first_pass_tr_f,\n'
+        r'(?:(?!\n        \)).)*?Y_full=Y_tr_f,\n'
+        r'(?:(?!\n        \)).)*?\n        \))'
+    )
+    text = sub_once(oof_pattern, lambda m: m.group(1) + OOF_A2, text, "OOF ResidualSSM block", re.S)
+
+    text = sub_once(
+        r'final_scores\s*=\s*first_pass\s*\+\s*correction_weight\s*\*\s*correction',
+        'final_scores = apply_classwise_correction(first_pass, correction, correction_weight)',
+        text,
+        "full correction application",
+    )
+    text = sub_once(
+        r'final_va\s*=\s*first_pass_va\s*\+\s*correction_weight\s*\*\s*va_correction',
+        'final_va = apply_classwise_correction(first_pass_va, va_correction, correction_weight)',
+        text,
+        "OOF correction application",
+    )
 
     path.write_text(text, encoding="utf-8")
     print(f"A2 patch applied: {path}")
