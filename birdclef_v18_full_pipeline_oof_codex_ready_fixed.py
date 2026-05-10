@@ -185,7 +185,9 @@ birdclassifier = tf.saved_model.load(str(MODEL_DIR))
 infer_fn       = birdclassifier.signatures["serving_default"]
 
 # ONNX session (150x faster)
-ONNX_PERCH_PATH = Path("/kaggle/input/datasets/rishikeshjani/perch-onnx-for-birdclef-2026/perch_v2.onnx")
+# [FIX 1] no-DFT variant preferred (tuckerarrants/perch-v2-no-dft-onnx), fallback to standard
+ONNX_PERCH_PATH = next(INPUT_ROOT.glob("**/perch_v2_no_dft*.onnx"),
+                   next(INPUT_ROOT.glob("**/perch_v2*.onnx"), Path("")))
 USE_ONNX = _ONNX_AVAILABLE and ONNX_PERCH_PATH.exists()
 
 if USE_ONNX:
@@ -195,7 +197,7 @@ if USE_ONNX:
                                             providers=["CPUExecutionProvider"])
     ONNX_INPUT_NAME = ONNX_SESSION.get_inputs()[0].name
     ONNX_OUT_MAP    = {o.name: i for i, o in enumerate(ONNX_SESSION.get_outputs())}
-    print("Using ONNX Perch (150x faster)")
+    print(f"Using ONNX Perch: {ONNX_PERCH_PATH.name}")
 else:
     print("Using TF SavedModel Perch")
 
@@ -551,86 +553,111 @@ print("✅ Temporal smoothing helper defined")
 # ── Cell 7c: Prior table builder ───────────────────────────────────────
 def build_prior_tables(sc_df, Y_labels):
     """
-    Build site-level and hour-level species frequency tables.
-    
-    These answer: "How often is species X observed at site S at hour H?"
-    
-    We use these as a soft prior: add them to raw Perch logits.
+    Build site-level, hour-level, and joint site×hour species frequency tables.
+    [FIX 2] Added 3rd tier: joint site×hour bucket (shrinkage factor=4).
+    This was the key change in Reference v5→v6 (+0.007 LB).
     """
     sc_df = sc_df.reset_index(drop=True)
     global_p = Y_labels.mean(axis=0).astype(np.float32)  # overall frequency
-    
+
     # ── Site-level frequencies ──────────────────────────────────────────
     site_keys = sorted(sc_df["site"].dropna().astype(str).unique())
     site_to_i = {k: i for i, k in enumerate(site_keys)}
     site_p    = np.zeros((len(site_keys), Y_labels.shape[1]), dtype=np.float32)
     site_n    = np.zeros(len(site_keys), dtype=np.float32)
-    
+
     for s in site_keys:
-        i     = site_to_i[s]
-        mask  = sc_df["site"].astype(str).values == s
+        i         = site_to_i[s]
+        mask      = sc_df["site"].astype(str).values == s
         site_n[i] = mask.sum()
         site_p[i] = Y_labels[mask].mean(axis=0)
-    
+
     # ── Hour-level frequencies ──────────────────────────────────────────
     hour_keys = sorted(sc_df["hour_utc"].dropna().astype(int).unique())
     hour_to_i = {h: i for i, h in enumerate(hour_keys)}
     hour_p    = np.zeros((len(hour_keys), Y_labels.shape[1]), dtype=np.float32)
     hour_n    = np.zeros(len(hour_keys), dtype=np.float32)
-    
+
     for h in hour_keys:
-        i     = hour_to_i[h]
-        mask  = sc_df["hour_utc"].astype(int).values == h
+        i         = hour_to_i[h]
+        mask      = sc_df["hour_utc"].astype(int).values == h
         hour_n[i] = mask.sum()
         hour_p[i] = Y_labels[mask].mean(axis=0)
-    
+
+    # ── [FIX 2] Joint site×hour bucket (tighter shrinkage factor=4) ─────
+    sh_keys = sorted({
+        (str(s), int(h))
+        for s, h in zip(sc_df["site"].dropna(), sc_df["hour_utc"].dropna())
+        if not pd.isna(s) and not pd.isna(h)
+    })
+    sh_to_i = {k: i for i, k in enumerate(sh_keys)}
+    sh_p    = np.zeros((len(sh_keys), Y_labels.shape[1]), dtype=np.float32)
+    sh_n    = np.zeros(len(sh_keys), dtype=np.float32)
+
+    for (s, h) in sh_keys:
+        i       = sh_to_i[(s, h)]
+        mask    = ((sc_df["site"].astype(str).values == s) &
+                   (sc_df["hour_utc"].astype(int).values == h))
+        sh_n[i] = mask.sum()
+        sh_p[i] = Y_labels[mask].mean(axis=0)
+
+    print(f"Prior tables: {len(site_keys)} sites | {len(hour_keys)} hours "
+          f"| {len(sh_keys)} site×hour buckets")
+
     return {
         "global_p": global_p,
         "site_to_i": site_to_i, "site_p": site_p, "site_n": site_n,
         "hour_to_i": hour_to_i, "hour_p": hour_p, "hour_n": hour_n,
+        "sh_to_i":  sh_to_i,   "sh_p":  sh_p,   "sh_n":  sh_n,
     }
 
 
 def apply_prior(scores, sites, hours, tables, lambda_prior=0.4):
     """
     Add a scaled prior logit to the raw Perch scores.
-    
-    lambda_prior=0: no effect (your baseline)
-    lambda_prior=0.4: moderate influence from location/time
-    
-    The prior is converted to a logit (log-odds) before adding.
-    This is mathematically correct — you add logits, not probabilities.
+    [FIX 2] Added 3rd tier: joint site×hour bucket (shrinkage factor=4).
+    Tier order: global → hour → site → site×hour (each refines the previous).
     """
     eps = 1e-4
     n   = len(scores)
     out = scores.copy()
-    
-    # Start from global average
+
+    # Tier 1: start from global average
     p = np.tile(tables["global_p"], (n, 1))  # (n, 234)
-    
-    # Override with hour-level estimate (if enough data)
+
+    # Tier 2: hour-level estimate (shrinkage factor=8)
     for i, h in enumerate(hours):
         h = int(h)
         if h in tables["hour_to_i"]:
-            j   = tables["hour_to_i"][h]
-            nh  = tables["hour_n"][j]
-            w   = nh / (nh + 8.0)   # shrink toward global if little data
+            j    = tables["hour_to_i"][h]
+            nh   = tables["hour_n"][j]
+            w    = nh / (nh + 8.0)
             p[i] = w * tables["hour_p"][j] + (1 - w) * tables["global_p"]
-    
-    # Override with site-level estimate (if enough data)
+
+    # Tier 3: site-level estimate (shrinkage factor=8)
     for i, s in enumerate(sites):
         s = str(s)
         if s in tables["site_to_i"]:
-            j   = tables["site_to_i"][s]
-            ns  = tables["site_n"][j]
-            w   = ns / (ns + 8.0)   # same shrinkage logic
+            j    = tables["site_to_i"][s]
+            ns   = tables["site_n"][j]
+            w    = ns / (ns + 8.0)
             p[i] = w * tables["site_p"][j] + (1 - w) * p[i]
-    
+
+    # [FIX 2] Tier 4: joint site×hour bucket (shrinkage factor=4 — tighter)
+    if "sh_to_i" in tables:
+        for i, (s, h) in enumerate(zip(sites, hours)):
+            key = (str(s), int(h))
+            if key in tables["sh_to_i"]:
+                j    = tables["sh_to_i"][key]
+                nsh  = tables["sh_n"][j]
+                w    = nsh / (nsh + 4.0)
+                p[i] = w * tables["sh_p"][j] + (1 - w) * p[i]
+
     # Convert prior probability to logit and add
-    p      = np.clip(p, eps, 1 - eps)
+    p           = np.clip(p, eps, 1 - eps)
     logit_prior = np.log(p) - np.log1p(-p)
-    out   += lambda_prior * logit_prior
-    
+    out        += lambda_prior * logit_prior
+
     return out.astype(np.float32)
 
 
@@ -1956,5 +1983,477 @@ sub.to_csv("submission.csv", index=False)
 print(f"\nsubmission.csv saved — shape {sub.shape}")
 print(f"Total wall time: {(time.time() - _WALL_START)/60:.1f} min")
 
- 
- 
+# ProtoSSM 単体提出を別名でも保存（後段のブレンドセルで参照する）
+sub.to_csv("submission_protossm.csv", index=False)
+print("submission_protossm.csv も保存しました（SEDブレンド用）")
+
+# ── Cell 11: Distilled SED Branch ─────────────────────────────────────
+import librosa
+from scipy.ndimage import gaussian_filter1d
+
+N_MELS_SED = 256
+N_FFT_SED  = 2048
+HOP_SED    = 512
+FMIN_SED   = 20
+FMAX_SED   = 16_000
+TOP_DB_SED = 80
+
+def _find_sed_dir():
+    hits = sorted(Path("/kaggle/input").rglob("sed_fold0.onnx"))
+    if not hits:
+        raise FileNotFoundError("sed_fold0.onnx が見つかりません。")
+    return hits[0].parent
+
+def _make_sed_session(path):
+    so = ort.SessionOptions()
+    so.intra_op_num_threads  = 4
+    so.inter_op_num_threads  = 1
+    so.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
+    return ort.InferenceSession(
+        str(path), sess_options=so, providers=["CPUExecutionProvider"]
+    )
+
+def audio_to_mel(chunks):
+    mels = []
+    for x in chunks:
+        s = librosa.feature.melspectrogram(
+            y=x, sr=SR, n_fft=N_FFT_SED, hop_length=HOP_SED,
+            n_mels=N_MELS_SED, fmin=FMIN_SED, fmax=FMAX_SED, power=2.0,
+        )
+        s = librosa.power_to_db(s, top_db=TOP_DB_SED)
+        s = (s - s.mean()) / (s.std() + 1e-6)
+        mels.append(s)
+    return np.stack(mels)[:, None].astype(np.float32)
+
+def file_to_sed_chunks(path):
+    y, sr0 = sf.read(str(path), dtype="float32", always_2d=False)
+    if y.ndim == 2:
+        y = y.mean(axis=1)
+    if sr0 != SR:
+        y = librosa.resample(y, orig_sr=sr0, target_sr=SR)
+    n = 60 * SR
+    y = np.pad(y, (0, max(0, n - len(y))))[:n]
+    chunks = y.reshape(N_WINDOWS, WINDOW_SAMPLES)
+    ends   = np.arange(1, N_WINDOWS + 1) * WINDOW_SEC
+    return chunks, ends
+
+def sigmoid_sed(x):
+    return (1.0 / (1.0 + np.exp(-np.clip(x, -50, 50)))).astype(np.float32)
+
+def run_sed_on_paths(audio_paths, sed_sessions_list, desc="SED"):
+    all_rows, all_preds = [], []
+    for path in tqdm(audio_paths, desc=desc):
+        chunks, ends = file_to_sed_chunks(path)
+        mel   = audio_to_mel(chunks)
+        p_sum = np.zeros((len(chunks), N_CLASSES), dtype=np.float32)
+        for sess in sed_sessions_list:
+            outs   = sess.run(None, {sess.get_inputs()[0].name: mel})
+            p_sum += 0.5 * sigmoid_sed(outs[0]) + 0.5 * sigmoid_sed(outs[1].max(axis=1))
+        p_mean = (p_sum / len(sed_sessions_list)).astype(np.float32)
+        if len(p_mean) > 1:
+            p_mean = gaussian_filter1d(
+                p_mean, sigma=0.65, axis=0, mode="nearest"
+            ).astype(np.float32)
+        stem = path.stem
+        all_rows.extend([f"{stem}_{int(t)}" for t in ends])
+        all_preds.append(p_mean)
+    preds_arr = np.clip(np.concatenate(all_preds, axis=0), 0.0, 1.0)
+    return np.array(all_rows), preds_arr
+
+_SED_AVAILABLE = False
+sed_sessions   = []
+try:
+    _sed_dir        = _find_sed_dir()
+    _sed_fold_paths = sorted(
+        _sed_dir.glob("sed_fold*.onnx"),
+        key=lambda p: int(re.search(r"sed_fold(\d+)", p.name).group(1)),
+    )
+    sed_sessions    = [_make_sed_session(p) for p in _sed_fold_paths]
+    _SED_AVAILABLE  = True
+    print(f"SED: {len(sed_sessions)} folds  dir={_sed_dir}")
+except FileNotFoundError as _e:
+    print(f"SED ONNX が見つかりません: {_e}")
+    print("  → SED ブランチをスキップ。ProtoSSM 単体提出を使用します。")
+
+if _SED_AVAILABLE:
+    _test_paths_sed = sorted((BASE / "test_soundscapes").glob("*.ogg"))
+    if not _test_paths_sed:
+        _n = CFG["dryrun_n_files"] or 20
+        _test_paths_sed = sorted((BASE / "train_soundscapes").glob("*.ogg"))[:_n]
+        print(f"Dry-run: SED を訓練音声 {len(_test_paths_sed)} ファイルで実行")
+
+    _sed_rows_te, _sed_preds_te = run_sed_on_paths(
+        _test_paths_sed, sed_sessions, desc="SED (test)"
+    )
+    _sed_sub = pd.DataFrame(
+        np.clip(_sed_preds_te, 0.0, 1.0), columns=PRIMARY_LABELS
+    )
+    _sed_sub.insert(0, "row_id", _sed_rows_te)
+    _sed_sub.to_csv("submission_sed.csv", index=False)
+    print(f"submission_sed.csv 保存完了  shape={_sed_sub.shape}")
+
+    _train_paths_sed = sorted((BASE / "train_soundscapes").glob("*.ogg"))
+    _train_paths_sed = [p for p in _train_paths_sed if p.name in set(full_files)]
+
+    _sed_rows_tr, _sed_preds_tr_raw = run_sed_on_paths(
+        _train_paths_sed, sed_sessions, desc="SED (train-OOF)"
+    )
+    _sed_row_to_idx = {rid: i for i, rid in enumerate(_sed_rows_tr)}
+    _tr_row_ids     = meta_tr["row_id"].to_numpy()
+
+    _missing = set(_tr_row_ids) - set(_sed_row_to_idx)
+    if _missing:
+        raise RuntimeError(f"SED予測にないrow_id: {len(_missing)}件")
+    _aligned_idx         = np.array([_sed_row_to_idx[r] for r in _tr_row_ids])
+    sed_preds_tr_aligned = _sed_preds_tr_raw[_aligned_idx]
+
+    _sed_tr_auc = macro_auc(Y_FULL_aligned, sed_preds_tr_aligned)
+    print(f"SED (train) AUC: {_sed_tr_auc:.6f}  shape={sed_preds_tr_aligned.shape}")
+    print("Cell 11 完了")
+else:
+    sed_preds_tr_aligned = None
+    print("SED 利用不可 — Cell 12 はグリッド探索をスキップします。")
+
+# ── Cell 12: OOF評価 + ブレンド比率最適化 ─────────────────────────────
+_OOF_N_SPLITS  = 3
+_OOF_N_EPOCHS  = 40
+_OOF_PATIENCE  = 8
+_RES_N_EPOCHS  = 20
+_RES_PATIENCE  = 6
+_N_SITES_CAP   = 20
+_EPS           = 1e-5
+
+_OOF_CACHE = WORK_DIR / "oof_proto_probs.npy"
+
+def _get_site_hour_ids_for_fold(meta_df, fn_list, site2i, n_sites_cap=_N_SITES_CAP):
+    site_ids = np.array([
+        min(site2i.get(meta_df.loc[meta_df["filename"] == fn, "site"].iloc[0], 0), n_sites_cap - 1)
+        for fn in fn_list
+    ], dtype=np.int64)
+    hour_ids = np.array([
+        int(meta_df.loc[meta_df["filename"] == fn, "hour_utc"].iloc[0]) % 24
+        for fn in fn_list
+    ], dtype=np.int64)
+    return site_ids, hour_ids
+
+def run_full_pipeline_oof_v2(
+    emb_full, sc_full, Y_full, meta_full,
+    n_splits=3, n_epochs=40, patience=8,
+    res_n_epochs=20, res_patience=6,
+):
+    file_meta = meta_full.drop_duplicates("filename").reset_index(drop=True)
+    gkf       = GroupKFold(n_splits=n_splits)
+    oof_probs = np.zeros((len(sc_full), N_CLASSES), dtype=np.float32)
+    _prior    = build_prior_tables(sc, Y_SC)
+
+    for fold, (tr_f, va_f) in enumerate(
+        gkf.split(file_meta, groups=file_meta["filename"]), 1
+    ):
+        t_fold    = time.time()
+        tr_fnames = set(file_meta.iloc[tr_f]["filename"])
+        va_fnames = set(file_meta.iloc[va_f]["filename"])
+        tr_mask   = meta_full["filename"].isin(tr_fnames).values
+        va_mask   = meta_full["filename"].isin(va_fnames).values
+
+        emb_tr_f  = emb_full[tr_mask];  sc_tr_f  = sc_full[tr_mask]
+        Y_tr_f    = Y_full[tr_mask];    meta_tr_f = meta_full[tr_mask].reset_index(drop=True)
+        emb_va_f  = emb_full[va_mask];  sc_va_f  = sc_full[va_mask]
+        meta_va_f = meta_full[va_mask].reset_index(drop=True)
+
+        n_va = len(emb_va_f) // N_WINDOWS
+        n_tr = len(emb_tr_f) // N_WINDOWS
+
+        proto_model, site2i = train_light_proto_ssm(
+            emb_tr_f, sc_tr_f, Y_tr_f, meta_tr_f,
+            n_epochs=n_epochs, patience=patience, lr=1e-3, verbose=False,
+        )
+
+        va_fn_list = meta_va_f.drop_duplicates("filename")["filename"].tolist()
+        va_site_ids, va_hour_ids = _get_site_hour_ids_for_fold(meta_va_f, va_fn_list, site2i)
+
+        proto_model.eval()
+        with torch.no_grad():
+            proto_va = proto_model(
+                torch.tensor(emb_va_f.reshape(n_va, N_WINDOWS, -1), dtype=torch.float32),
+                torch.tensor(sc_va_f.reshape(n_va, N_WINDOWS, -1),  dtype=torch.float32),
+                site_ids=torch.tensor(va_site_ids, dtype=torch.long),
+                hours   =torch.tensor(va_hour_ids, dtype=torch.long),
+            ).numpy().reshape(-1, N_CLASSES)
+
+        sc_va_prior = apply_prior(sc_va_f,
+            sites=meta_va_f["site"].to_numpy(), hours=meta_va_f["hour_utc"].to_numpy(),
+            tables=_prior, lambda_prior=0.4)
+        probe_models, emb_scaler, emb_pca, alpha_blend = train_mlp_probes(
+            emb=emb_tr_f, scores_raw=sc_tr_f, Y=Y_tr_f, min_pos=5, pca_dim=64, alpha_blend=0.4)
+        sc_va_mlp = apply_mlp_probes_vectorized(
+            emb_va_f, sc_va_prior, probe_models, emb_scaler, emb_pca, alpha_blend)
+        first_pass_va = 0.5 * proto_va + 0.5 * sc_va_mlp
+
+        tr_fn_list = meta_tr_f.drop_duplicates("filename")["filename"].tolist()
+        tr_site_ids_f, tr_hour_ids_f = _get_site_hour_ids_for_fold(meta_tr_f, tr_fn_list, site2i)
+
+        proto_tr_tta = run_tta_proto(
+            proto_model, emb_tr_f.reshape(n_tr, N_WINDOWS, -1),
+            sc_tr_f.reshape(n_tr, N_WINDOWS, -1),
+            site_t=torch.tensor(tr_site_ids_f, dtype=torch.long),
+            hour_t=torch.tensor(tr_hour_ids_f, dtype=torch.long),
+            shifts=[0, 1, -1, 2, -2],
+        )
+        sc_tr_prior_f = apply_prior(sc_tr_f,
+            sites=meta_tr_f["site"].to_numpy(), hours=meta_tr_f["hour_utc"].to_numpy(),
+            tables=_prior, lambda_prior=0.4)
+        sc_tr_mlp_f = apply_mlp_probes_vectorized(
+            emb_tr_f, sc_tr_prior_f, probe_models, emb_scaler, emb_pca, alpha_blend)
+        first_pass_tr_f = (0.5 * proto_tr_tta.reshape(-1, N_CLASSES) + 0.5 * sc_tr_mlp_f)
+
+        res_model, correction_weight = train_residual_ssm(
+            emb_full=emb_tr_f, first_pass_flat=first_pass_tr_f, Y_full=Y_tr_f,
+            site_ids=tr_site_ids_f, hour_ids=tr_hour_ids_f,
+            n_epochs=res_n_epochs, patience=res_patience,
+            lr=1e-3, correction_weight=0.30, verbose=False)
+
+        res_model.eval()
+        with torch.no_grad():
+            va_correction = res_model(
+                torch.tensor(emb_va_f.reshape(n_va, N_WINDOWS, -1), dtype=torch.float32),
+                torch.tensor(first_pass_va.reshape(n_va, N_WINDOWS, -1), dtype=torch.float32),
+                site_ids=torch.tensor(va_site_ids, dtype=torch.long),
+                hours   =torch.tensor(va_hour_ids, dtype=torch.long),
+            ).numpy().reshape(-1, N_CLASSES)
+
+        final_va = first_pass_va + correction_weight * va_correction
+        final_va = final_va / temperatures[None, :]
+        probs_va = sigmoid(final_va)
+        probs_va = file_confidence_scale(probs_va, n_windows=N_WINDOWS, top_k=2, power=0.4)
+        probs_va = rank_aware_scaling(probs_va, n_windows=N_WINDOWS, power=0.4)
+        probs_va = adaptive_delta_smooth(probs_va, n_windows=N_WINDOWS, base_alpha=0.20)
+        probs_va = np.clip(probs_va, 0.0, 1.0).astype(np.float32)
+
+        oof_probs[va_mask] = probs_va
+        fold_auc = macro_auc(Y_full[va_mask], probs_va)
+        print(f"  Fold {fold}/{n_splits} | val={len(va_fnames):2d}files "
+              f"| AUC={fold_auc:.6f} | {time.time()-t_fold:.1f}s")
+
+        del proto_model, probe_models, res_model
+        gc.collect()
+
+    overall_auc = macro_auc(Y_full, oof_probs)
+    print(f"\n[ProtoSSM OOF v2] 全体 AUC: {overall_auc:.6f}")
+    return oof_probs, overall_auc
+
+if _OOF_CACHE.exists():
+    oof_proto_probs = np.load(str(_OOF_CACHE))
+    _proto_oof_auc  = macro_auc(Y_FULL_aligned, oof_proto_probs)
+    print(f"OOF キャッシュを読み込みました: {_OOF_CACHE}")
+    print(f"[ProtoSSM OOF v2] AUC = {_proto_oof_auc:.6f}")
+else:
+    print("="*60)
+    print("S1 Step 1: ProtoSSM フルパイプライン OOF 予測を実行中…")
+    print(f"  {_OOF_N_SPLITS}-fold GroupKFold | "
+          f"n_epochs={_OOF_N_EPOCHS} | patience={_OOF_PATIENCE}")
+    print("="*60)
+    _t0 = time.time()
+    oof_proto_probs, _proto_oof_auc = run_full_pipeline_oof_v2(
+        emb_tr, sc_tr, Y_FULL_aligned, meta_tr,
+        n_splits=_OOF_N_SPLITS,
+        n_epochs=_OOF_N_EPOCHS, patience=_OOF_PATIENCE,
+        res_n_epochs=_RES_N_EPOCHS, res_patience=_RES_PATIENCE,
+    )
+    np.save(str(_OOF_CACHE), oof_proto_probs)
+    print(f"OOF 完了: {time.time()-_t0:.1f}s  → キャッシュ保存: {_OOF_CACHE}")
+
+def _to_rank(p):
+    return pd.DataFrame(p).rank(axis=0, pct=True).to_numpy(np.float32)
+
+def _blend_auc(rank_a, rank_b, w_a, Y_true):
+    return macro_auc(Y_true, rank_a * w_a + rank_b * (1.0 - w_a))
+
+def optimize_blend_ratio(oof_proto, oof_sed, Y_true,
+                         w_grid=None, use_optuna=True, n_optuna_trials=60):
+    if w_grid is None:
+        w_grid = np.round(np.arange(0.30, 0.81, 0.05), 2)
+
+    r_proto = _to_rank(np.clip(oof_proto, _EPS, 1.0 - _EPS))
+    r_sed   = _to_rank(np.clip(oof_sed,   _EPS, 1.0 - _EPS))
+
+    print("\n--- グリッド探索 (w_proto: 0.30 → 0.80) ---")
+    _ref_60_40 = _blend_auc(r_proto, r_sed, 0.60, Y_true)
+    print(f"  [参考] ProtoSSM 単体   : {macro_auc(Y_true, oof_proto):.6f}")
+    print(f"  [参考] SED 単体        : {macro_auc(Y_true, oof_sed):.6f}")
+    print(f"  [参考] 固定 60/40      : {_ref_60_40:.6f}  ← 現在の設定")
+    print()
+
+    _grid = []
+    for w in w_grid:
+        auc    = _blend_auc(r_proto, r_sed, w, Y_true)
+        marker = " ←" if abs(w - 0.60) < 0.01 else ""
+        print(f"  w_proto={w:.2f} | AUC={auc:.6f}{marker}")
+        _grid.append((w, auc))
+
+    _best_w_grid, _best_auc_grid = max(_grid, key=lambda x: x[1])
+    print(f"\n[グリッド] 最良: w_proto={_best_w_grid:.2f} → AUC={_best_auc_grid:.6f} "
+          f"(Δ vs 60/40 = {_best_auc_grid - _ref_60_40:+.6f})")
+
+    _best_w = _best_w_grid
+
+    if use_optuna:
+        try:
+            import optuna
+            optuna.logging.set_verbosity(optuna.logging.WARNING)
+
+            def _objective(trial):
+                w = trial.suggest_float("w_proto", 0.30, 0.80)
+                return _blend_auc(r_proto, r_sed, w, Y_true)
+
+            study = optuna.create_study(
+                direction="maximize",
+                sampler=optuna.samplers.TPESampler(seed=42),
+            )
+            study.enqueue_trial({"w_proto": _best_w_grid})
+            study.optimize(_objective, n_trials=n_optuna_trials, show_progress_bar=True)
+
+            _best_w     = study.best_params["w_proto"]
+            _best_auc_o = study.best_value
+            print(f"\n[Optuna] 最良: w_proto={_best_w:.4f} → AUC={_best_auc_o:.6f} "
+                  f"(Δ vs グリッド = {_best_auc_o - _best_auc_grid:+.6f})")
+
+        except ImportError:
+            print("\nOptuna 未インストール → グリッド結果を採用します。")
+
+    return float(_best_w), float(1.0 - _best_w)
+
+if _SED_AVAILABLE and sed_preds_tr_aligned is not None:
+    print("\n" + "="*60)
+    print("S1 Step 2: ブレンド比率最適化")
+    print("="*60)
+    _oof_w_proto, _oof_w_sed = optimize_blend_ratio(
+        oof_proto=oof_proto_probs,
+        oof_sed=sed_preds_tr_aligned,
+        Y_true=Y_FULL_aligned,
+        use_optuna=True,
+        n_optuna_trials=60,
+    )
+    print(f"\nOOF最適ブレンド比率: w_proto={_oof_w_proto:.4f} / w_sed={_oof_w_sed:.4f}")
+    print("  ※ SED訓練データ適用によるリーク注意 → LB実証値を優先")
+else:
+    _oof_w_proto = 1.0
+    _oof_w_sed   = 0.0
+    print("SED 利用不可 — ProtoSSM 単体 (w_proto=1.00) を使用します。")
+
+# [FIX 3] LB実証済みの最良値 w_proto=0.60 を採用
+# LB実験ログ:
+#   ProtoSSM 単体 (1.00) : LB 0.927
+#   50/50               : LB 0.941
+#   60/40               : LB 0.946  ← 実証済み最良
+#   TTA あり 60/40       : LB 0.939  ← TTA はテストでは逆効果と確定
+BLEND_W_PROTO = 0.60   # [FIX 3] 0.65 → 0.60 (LB実証値)
+BLEND_W_SED   = 1.0 - BLEND_W_PROTO
+print(f"\n[FIX 3] 採用ブレンド比率: w_proto={BLEND_W_PROTO:.2f} / w_sed={BLEND_W_SED:.2f}  (LB実証済み)")
+print("Cell 12 完了")
+
+# ── Cell 13: 最適ブレンド比率で最終 submission を再生成 ─────────────────
+print("="*60)
+print(f"S1 Step 3: 最適ブレンドで submission.csv を再生成")
+print(f"  w_proto={BLEND_W_PROTO:.4f}  w_sed={BLEND_W_SED:.4f}")
+print("="*60)
+
+if not _SED_AVAILABLE:
+    import shutil
+    shutil.copy("submission_protossm.csv", "submission.csv")
+    print("SED 利用不可 → submission_protossm.csv を submission.csv にコピーしました。")
+else:
+    _EPS_BLEND = 1e-5
+
+    _df_proto = pd.read_csv("submission_protossm.csv")
+    _df_sed   = pd.read_csv("submission_sed.csv")
+    _cols     = [c for c in _df_proto.columns if c != "row_id"]
+
+    _df_sed = _df_sed.set_index("row_id").loc[_df_proto["row_id"]].reset_index()
+
+    _p_proto = np.clip(_df_proto[_cols].to_numpy(np.float32), _EPS_BLEND, 1.0 - _EPS_BLEND)
+    _p_sed   = np.clip(_df_sed  [_cols].to_numpy(np.float32), _EPS_BLEND, 1.0 - _EPS_BLEND)
+
+    _r_proto = pd.DataFrame(_p_proto).rank(axis=0, pct=True).to_numpy(np.float32)
+    _r_sed   = pd.DataFrame(_p_sed  ).rank(axis=0, pct=True).to_numpy(np.float32)
+
+    _pred = _r_proto * BLEND_W_PROTO + _r_sed * BLEND_W_SED
+
+    _row_ids  = _df_proto["row_id"].astype(str).to_numpy()
+    _file_ids = np.array(["_".join(r.split("_")[:-1]) for r in _row_ids])
+
+    # ── Gate 1: ノイズ抑制 ─────────────────────────────────────────────
+    _fake_only = (_p_proto > 0.50) & (_p_sed < 0.05)
+    _pred = np.where(_fake_only, (1.0 - 0.08) * _pred + 0.08 * _r_proto, _pred)
+
+    # ── Gate 2: 時間的連続性 (fat-tail t分布カーネル, 35秒窓) ────────────
+    _offs         = np.arange(-3, 4, dtype=np.float32)
+    _proto_kernel = (1.0 + (_offs / 1.20) ** 2 / 2.0) ** (-1.5)
+    _proto_kernel = (_proto_kernel / _proto_kernel.sum()).astype(np.float32)
+    _pa_ctx       = _p_proto.copy()
+    for _fid in pd.unique(_file_ids):
+        _m = _file_ids == _fid
+        _x = _p_proto[_m]
+        if len(_x) > 1:
+            _xp = np.pad(_x, ((3, 3), (0, 0)), mode="edge")
+            _pa_ctx[_m] = sum(_proto_kernel[i] * _xp[i:i + len(_x)] for i in range(7))
+    _xctx       = pd.DataFrame(_pa_ctx).rank(axis=0, pct=True).to_numpy(np.float32)
+    _proto_cont = ((_xctx > 0.88) & (_r_proto > 0.75) & (_p_sed < 0.12) & (~_fake_only))
+    _pred = np.where(_proto_cont,
+                     (1.0 - 0.15) * _pred + 0.15 * np.maximum(_r_proto, _xctx), _pred)
+
+    # ── Gate 3: SED スパイク保存 ───────────────────────────────────────
+    _sed_only = ((_r_sed > 0.95) & (_r_proto < 0.80) & (~_fake_only) & (~_proto_cont))
+    _pred = np.where(_sed_only, (1.0 - 0.12) * _pred + 0.12 * _r_sed, _pred)
+
+    _sub      = _df_proto.copy()
+    _sub[_cols] = _pred.astype(np.float32)
+
+    # ── Gate 4: ソノタイプミラーリング ────────────────────────────────
+    _MIRROR_PAIRS = (
+        ("47158son15", "47158son16"),
+        ("47158son09", "47158son12"),
+        ("47158son02", "47158son14"),
+        ("47158son13", "47158son21", "47158son22", "47158son23"),
+    )
+    _col_to_idx   = {lbl: i for i, lbl in enumerate(_cols)}
+    _mirror_count = 0
+    for _grp in _MIRROR_PAIRS:
+        _vidx = [_col_to_idx[s] for s in _grp if s in _col_to_idx]
+        if len(_vidx) >= 2:
+            _gmax = _sub[_cols].iloc[:, _vidx].max(axis=1).to_numpy(np.float32)
+            for _idx in _vidx:
+                _sub.iloc[:, _idx + 1] = _gmax
+            _mirror_count += len(_vidx)
+    print(f"ソノタイプミラーリング: {_mirror_count} 列に適用")
+
+    # ── Gate 5: レア種の低信頼スコアを抑制 ──────────────────────────────
+    try:
+        _tax_df     = pd.read_csv(BASE / "taxonomy.csv").set_index("primary_label")
+        _rare_cls   = {"Amphibia", "Mammalia", "Reptilia"}
+        _rare_count = 0
+        for _ci, _sp in enumerate(_cols):
+            if _sp in _tax_df.index and _tax_df.loc[_sp, "class_name"] in _rare_cls:
+                _vals = _sub.iloc[:, _ci + 1].to_numpy(np.float32)
+                _thr  = _vals.mean() + 0.05
+                _sub.iloc[:, _ci + 1] = np.where(_vals < _thr, _vals * 0.9, _vals)
+                _rare_count += 1
+        print(f"レア種抑制: {_rare_count} クラスに適用")
+    except Exception as _ex:
+        print(f"レア種抑制スキップ: {_ex}")
+
+    # ── ドライラン対応 ─────────────────────────────────────────────────
+    _test_check = list((BASE / "test_soundscapes").glob("*.ogg"))
+    if not _test_check:
+        _sample_pub = pd.read_csv(BASE / "sample_submission.csv")
+        _tmpl       = _sub[_cols].mean(axis=0).astype(np.float32)
+        _sub        = _sample_pub.copy()
+        for _lbl in _cols:
+            _sub[_lbl] = _tmpl[_lbl]
+        print("ドライラン: sample_submission の行順に揃えました。")
+
+    _sub.to_csv("submission.csv", index=False)
+    print(f"\nsubmission.csv 保存完了  shape={_sub.shape}")
+    print(f"  w_proto={BLEND_W_PROTO:.4f} / w_sed={BLEND_W_SED:.4f}")
+
+print(f"\nS1 OOF Blend Optimization 完了")
+print(f"総経過時間: {(time.time() - _WALL_START)/60:.1f} min")
