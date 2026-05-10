@@ -1,37 +1,24 @@
 """B1 seed ensemble CV runner for BirdCLEF V18.
 
-Runs the V18 script multiple times with different seeds, collects OOF metrics,
-and builds an averaged ProtoSSM OOF prediction. This is for CV stability checks
-before spending Kaggle LB submissions.
-
-Typical Kaggle usage:
-  python BirdCLEF/codex-experiments/001/b1_seed_ensemble_runner.py \
-    --repo-dir /kaggle/working/BirdCLEF \
-    --seeds 42,43,44 \
-    --clean-oof-cache
-
-Notes:
-- The runner edits only the Kaggle working copy.
-- It expects V18 to create /kaggle/working/cache/oof_proto_probs.npy.
-- It preserves the Perch cache, but removes OOF cache between seeds.
-- It does not submit anything.
+Runs V18 multiple times with different seeds in separate Python subprocesses.
+This avoids TensorFlow/PyTorch/ONNX memory buildup inside one notebook process.
 """
 
 from __future__ import annotations
 
 import argparse
 import json
+import os
 import re
-import runpy
 import shutil
-from contextlib import redirect_stderr, redirect_stdout
+import subprocess
+import sys
 from pathlib import Path
 from typing import Any
 
 import numpy as np
 import pandas as pd
 from sklearn.metrics import roc_auc_score
-
 
 DEFAULT_REPO_DIR = Path("/kaggle/working/BirdCLEF")
 DEFAULT_CACHE_DIR = Path("/kaggle/working/cache")
@@ -69,13 +56,12 @@ def blend_auc(proto: np.ndarray, sed: np.ndarray, y: np.ndarray, w_proto: float)
     return macro_auc(y, rp * w_proto + rs * (1.0 - w_proto))
 
 
-def patch_script_for_seed(script_path: Path, seed: int) -> None:
-    text = script_path.read_text(encoding="utf-8")
+def patch_script_for_seed(src_script: Path, dst_script: Path, seed: int, seed_dir: Path) -> None:
+    text = src_script.read_text(encoding="utf-8")
     text = re.sub(r'(?m)^(\s*)MODE\s*=\s*["\'](?:train|submit)["\'](.*)$', r'\1MODE = "train"\2', text, count=1)
 
-    marker = "# B1_SEED_PATCH"
     seed_code = f'''
-{marker}
+# B1_SEED_PATCH
 import random as _b1_random
 _b1_seed = {seed}
 np.random.seed(_b1_seed)
@@ -91,66 +77,102 @@ except Exception:
 print(f"B1 seed patch active: {{_b1_seed}}")
 # /B1_SEED_PATCH
 '''
-    if marker in text:
-        text = re.sub(r'# B1_SEED_PATCH[\s\S]*?# /B1_SEED_PATCH\n', seed_code, text, count=1)
-    else:
-        anchor = 'print("Config ready")'
-        idx = text.find(anchor)
-        if idx < 0:
-            raise RuntimeError("Could not find Config ready anchor for seed patch")
-        line_end = text.find("\n", idx)
-        text = text[:line_end + 1] + seed_code + text[line_end + 1:]
+    anchor = 'print("Config ready")'
+    idx = text.find(anchor)
+    if idx < 0:
+        raise RuntimeError("Could not find Config ready anchor for seed patch")
+    line_end = text.find("\n", idx)
+    text = text[:line_end + 1] + seed_code + text[line_end + 1:]
 
-    script_path.write_text(text, encoding="utf-8")
-
-
-def copy_artifact(src: Path, dst: Path) -> None:
-    if not src.exists():
-        raise FileNotFoundError(src)
-    dst.parent.mkdir(parents=True, exist_ok=True)
-    shutil.copy2(src, dst)
+    save_code = f'''
+# B1_SAVE_ARTIFACTS
+try:
+    import numpy as _b1_np
+    from pathlib import Path as _b1_Path
+    _b1_dir = _b1_Path(r"{seed_dir}")
+    _b1_dir.mkdir(parents=True, exist_ok=True)
+    if "oof_proto_probs" in globals():
+        _b1_np.save(_b1_dir / "oof_proto_probs.npy", oof_proto_probs)
+    if "Y_FULL_aligned" in globals():
+        _b1_np.save(_b1_dir / "Y_FULL_aligned.npy", Y_FULL_aligned)
+    if "sed_preds_tr_aligned" in globals() and sed_preds_tr_aligned is not None:
+        _b1_np.save(_b1_dir / "sed_preds_tr_aligned.npy", sed_preds_tr_aligned)
+    print(f"B1 artifacts saved to {{_b1_dir}}")
+except Exception as _b1_ex:
+    print(f"B1 artifact save failed: {{_b1_ex}}")
+    raise
+# /B1_SAVE_ARTIFACTS
+'''
+    text = text + "\n" + save_code
+    dst_script.write_text(text, encoding="utf-8")
 
 
 def run_one_seed(args: argparse.Namespace, seed: int) -> dict[str, Any]:
-    script_path = args.repo_dir / "birdclef_v18_full_pipeline_oof_codex_ready_fixed.py"
-    patch_script_for_seed(script_path, seed)
+    src_script = args.repo_dir / "birdclef_v18_full_pipeline_oof_codex_ready_fixed.py"
+    seed_dir = args.output_dir / f"seed_{seed}"
+    seed_dir.mkdir(parents=True, exist_ok=True)
+    script_copy = seed_dir / "v18_seed_run.py"
+    log_path = seed_dir / "run.log"
+
+    patch_script_for_seed(src_script, script_copy, seed, seed_dir)
 
     oof_cache = args.cache_dir / "oof_proto_probs.npy"
     if args.clean_oof_cache and oof_cache.exists():
         oof_cache.unlink()
 
-    seed_dir = args.output_dir / f"seed_{seed}"
-    seed_dir.mkdir(parents=True, exist_ok=True)
-    log_path = seed_dir / "run.log"
+    env = os.environ.copy()
+    env["PYTHONUNBUFFERED"] = "1"
+    with log_path.open("w", encoding="utf-8") as log:
+        proc = subprocess.run(
+            [sys.executable, str(script_copy)],
+            cwd="/kaggle/working",
+            stdout=log,
+            stderr=subprocess.STDOUT,
+            env=env,
+            text=True,
+        )
+    if proc.returncode != 0:
+        raise RuntimeError(f"Seed {seed} failed with exit code {proc.returncode}. See {log_path}")
 
-    with log_path.open("w", encoding="utf-8") as f, redirect_stdout(f), redirect_stderr(f):
-        ns = runpy.run_path(str(script_path), run_name="__main__")
+    oof_path = seed_dir / "oof_proto_probs.npy"
+    y_path = seed_dir / "Y_FULL_aligned.npy"
+    if not oof_path.exists() or not y_path.exists():
+        raise RuntimeError(f"Seed {seed}: missing saved OOF artifacts. See {log_path}")
 
-    oof = ns.get("oof_proto_probs")
-    y = ns.get("Y_FULL_aligned")
-    sed = ns.get("sed_preds_tr_aligned")
-    if oof is None or y is None:
-        raise RuntimeError(f"Seed {seed}: expected oof_proto_probs and Y_FULL_aligned after run")
-
-    oof = np.asarray(oof, dtype=np.float32)
-    y = np.asarray(y)
-    np.save(seed_dir / "oof_proto_probs.npy", oof)
-    np.save(seed_dir / "Y_FULL_aligned.npy", y)
-    if sed is not None:
-        sed = np.asarray(sed, dtype=np.float32)
-        np.save(seed_dir / "sed_preds_tr_aligned.npy", sed)
+    oof = np.load(oof_path)
+    y = np.load(y_path)
+    sed_path = seed_dir / "sed_preds_tr_aligned.npy"
+    sed = np.load(sed_path) if sed_path.exists() else None
 
     metrics: dict[str, Any] = {
         "seed": seed,
         "proto_oof_auc": macro_auc(y, oof),
         "log_path": str(log_path),
-        "oof_path": str(seed_dir / "oof_proto_probs.npy"),
+        "oof_path": str(oof_path),
     }
     if sed is not None:
         metrics["blend_060_auc"] = blend_auc(oof, sed, y, 0.60)
         metrics["blend_065_auc"] = blend_auc(oof, sed, y, 0.65)
         metrics["blend_060_minus_065"] = metrics["blend_060_auc"] - metrics["blend_065_auc"]
     return metrics
+
+
+def load_existing(seed_dir: Path, seed: int) -> tuple[dict[str, Any], np.ndarray, np.ndarray, np.ndarray | None]:
+    oof = np.load(seed_dir / "oof_proto_probs.npy")
+    y = np.load(seed_dir / "Y_FULL_aligned.npy")
+    sed_path = seed_dir / "sed_preds_tr_aligned.npy"
+    sed = np.load(sed_path) if sed_path.exists() else None
+    metrics: dict[str, Any] = {
+        "seed": seed,
+        "proto_oof_auc": macro_auc(y, oof),
+        "log_path": str(seed_dir / "run.log"),
+        "oof_path": str(seed_dir / "oof_proto_probs.npy"),
+    }
+    if sed is not None:
+        metrics["blend_060_auc"] = blend_auc(oof, sed, y, 0.60)
+        metrics["blend_065_auc"] = blend_auc(oof, sed, y, 0.65)
+        metrics["blend_060_minus_065"] = metrics["blend_060_auc"] - metrics["blend_065_auc"]
+    return metrics, oof, y, sed
 
 
 def main() -> None:
@@ -166,27 +188,16 @@ def main() -> None:
     for seed in seeds:
         seed_dir = args.output_dir / f"seed_{seed}"
         if args.skip_existing and (seed_dir / "oof_proto_probs.npy").exists():
-            oof = np.load(seed_dir / "oof_proto_probs.npy")
-            y = np.load(seed_dir / "Y_FULL_aligned.npy")
-            sed_path = seed_dir / "sed_preds_tr_aligned.npy"
-            sed = np.load(sed_path) if sed_path.exists() else None
-            metrics = {"seed": seed, "proto_oof_auc": macro_auc(y, oof), "log_path": str(seed_dir / "run.log"), "oof_path": str(seed_dir / "oof_proto_probs.npy")}
-            if sed is not None:
-                metrics["blend_060_auc"] = blend_auc(oof, sed, y, 0.60)
-                metrics["blend_065_auc"] = blend_auc(oof, sed, y, 0.65)
-                metrics["blend_060_minus_065"] = metrics["blend_060_auc"] - metrics["blend_065_auc"]
+            metrics, oof, y, sed = load_existing(seed_dir, seed)
         else:
             metrics = run_one_seed(args, seed)
-            oof = np.load(metrics["oof_path"])
-            y = np.load(seed_dir / "Y_FULL_aligned.npy")
-            sed_path = seed_dir / "sed_preds_tr_aligned.npy"
-            sed = np.load(sed_path) if sed_path.exists() else None
-
+            metrics, oof, y, sed = load_existing(seed_dir, seed)
         rows.append(metrics)
         oofs.append(oof)
         y_ref = y if y_ref is None else y_ref
         if sed_ref is None and sed is not None:
             sed_ref = sed
+        print(f"completed seed={seed}: proto_oof_auc={metrics['proto_oof_auc']:.6f}")
 
     avg_oof = np.mean(np.stack(oofs, axis=0), axis=0).astype(np.float32)
     np.save(args.output_dir / "oof_proto_probs_seedavg.npy", avg_oof)
