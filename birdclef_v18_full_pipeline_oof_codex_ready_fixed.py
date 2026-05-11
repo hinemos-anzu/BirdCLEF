@@ -750,13 +750,13 @@ def build_sequential_features(scores_col, n_windows=12):
     return prev.reshape(-1), next_.reshape(-1), mean, max_, std
 
 
-def train_mlp_probes(emb, scores_raw, Y, min_pos=3, pca_dim=64, alpha_blend=0.4):
+def train_mlp_probes(emb, scores_raw, Y, min_pos=5, pca_dim=64, alpha_blend=0.4):
     """
     CHANGE 1: Upgraded MLP probe.
     - pca_dim: 32 → 64  (more embedding information)
     - hidden:  (32,) → (128, 64)  (more capacity)
     - max_iter: 100 → 300  (longer training)
-    - min_pos: 8 → 5 → 3  (catches more rare species with ≥3 positive windows)
+    - min_pos: 8 → 5  (catches more rare species; 3 caused LB regression)
     """
     # Step 1: Compress embeddings
     scaler = StandardScaler()
@@ -833,7 +833,7 @@ def apply_mlp_probes(emb_test, scores_test, probe_models, scaler, pca, alpha_ble
         result[:, ci] = (1 - alpha_blend) * scores_test[:, ci] + alpha_blend * logit
     return result
 
-print("✅ CHANGE 1: Upgraded MLP probe (pca_dim=64, hidden=(128,64), max_iter=300, min_pos=3)")
+print("✅ CHANGE 1: Upgraded MLP probe (pca_dim=64, hidden=(128,64), max_iter=300, min_pos=5)")
 # ── Cell 7f-2: Vectorized MLP probe inference ──────────────────────────
 import torch
 import torch.nn as nn
@@ -942,8 +942,7 @@ def calibrate_and_optimize_thresholds(oof_probs, Y_FULL,
     Returns: thresholds array of shape (n_classes,)
     """
     if threshold_grid is None:
-        threshold_grid = [0.10, 0.15, 0.20, 0.25, 0.30, 0.35, 0.40, 0.45,
-                          0.50, 0.55, 0.60, 0.65, 0.70, 0.75, 0.80]
+        threshold_grid = [0.25, 0.30, 0.35, 0.40, 0.45, 0.50, 0.55, 0.60, 0.65, 0.70]
     
     n_samples, n_cls = oof_probs.shape
     thresholds = np.full(n_cls, 0.5, dtype=np.float32)
@@ -1766,7 +1765,7 @@ def run_pipeline_oof(emb_full, sc_full, Y_full, meta_full, n_splits=5):
             emb_tr_f,
             sc_tr_f,
             Y_tr_f,
-            min_pos=3,
+            min_pos=5,
             pca_dim=64,
             alpha_blend=0.4,
         )
@@ -1872,7 +1871,7 @@ sc_te_adjusted = apply_prior(
 # ── Step D: MLP probes ─────────────────────────────────────────────────
 probe_models, emb_scaler, emb_pca, alpha_blend = train_mlp_probes(
     emb=emb_tr, scores_raw=sc_tr, Y=Y_FULL_aligned,
-    min_pos=3, pca_dim=64, alpha_blend=0.4,
+    min_pos=5, pca_dim=64, alpha_blend=0.4,
 )
 sc_te_adjusted = apply_mlp_probes_vectorized(
     emb_te, sc_te_adjusted,
@@ -1931,8 +1930,7 @@ train_probs_for_calib = sigmoid(first_pass_tr)
 PER_CLASS_THRESHOLDS = calibrate_and_optimize_thresholds(
     oof_probs=train_probs_for_calib,
     Y_FULL=Y_FULL_aligned,
-    threshold_grid=[0.10, 0.15, 0.20, 0.25, 0.30, 0.35, 0.40, 0.45,
-                    0.50, 0.55, 0.60, 0.65, 0.70, 0.75, 0.80],
+    threshold_grid=[0.25, 0.30, 0.35, 0.40, 0.45, 0.50, 0.55, 0.60, 0.65, 0.70],
     n_windows=N_WINDOWS,
 )
 
@@ -1948,7 +1946,7 @@ res_model, correction_weight = train_residual_ssm(
     n_epochs=30,
     patience=8,
     lr=1e-3,
-    correction_weight=CFG["residual_ssm"]["correction_weight"],  # 0.35 from CFG
+    correction_weight=0.30,  # 0.35 (CFG) caused LB regression; 0.30 is LB-validated
     verbose=False,
 )
 print(f"ResidualSSM training: {time.time()-t0:.1f}s")
