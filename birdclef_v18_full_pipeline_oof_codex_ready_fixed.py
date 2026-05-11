@@ -1889,7 +1889,7 @@ sc_te_adjusted = apply_mlp_probes_vectorized(
 )
 
 # ── Step E: First-pass ensemble (ProtoSSM + MLP) ───────────────────────
-ENSEMBLE_W      = 0.5
+ENSEMBLE_W      = 0.6  # TEST-3: 0.5→0.6 (ProtoSSM weight up; MLP probes cover only ~25% of species)
 first_pass_flat = (ENSEMBLE_W * proto_scores_flat
                    + (1.0 - ENSEMBLE_W) * sc_te_adjusted)
 
