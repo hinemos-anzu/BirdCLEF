@@ -38,10 +38,10 @@ MODE = "train"   # ← change to "train" for local CV
 assert MODE in {"train", "submit"}
 print("MODE =", MODE)
 # ── Cell 2: Imports & config ───────────────────────────────────────────
-import os, re, gc, time, warnings
+import os, re, gc, time, warnings, random
 os.environ["TF_CPP_MIN_LOG_LEVEL"] = "3"
 warnings.filterwarnings("ignore")
- 
+
 import numpy as np
 import pandas as pd
 import soundfile as sf
@@ -49,11 +49,17 @@ import tensorflow as tf
 from sklearn.metrics import roc_auc_score
 from sklearn.model_selection import GroupKFold
 from tqdm.auto import tqdm
- 
+
 tf.experimental.numpy.experimental_enable_numpy_behavior()
 try: tf.config.set_visible_devices([], "GPU")
 except: pass
- 
+
+def seed_everything(seed=42):
+    random.seed(seed)
+    os.environ['PYTHONHASHSEED'] = str(seed)
+    np.random.seed(seed)
+    # torch seeded after torch import below
+
 _WALL_START = time.time()
  
 BASE      = Path("/kaggle/input/competitions/birdclef-2026")
@@ -184,8 +190,9 @@ print(f"Full-file windows: {len(full_rows)} | Active classes: {int((Y_FULL.sum(0
 birdclassifier = tf.saved_model.load(str(MODEL_DIR))
 infer_fn       = birdclassifier.signatures["serving_default"]
 
-# ONNX session (150x faster)
-ONNX_PERCH_PATH = Path("/kaggle/input/datasets/rishikeshjani/perch-onnx-for-birdclef-2026/perch_v2.onnx")
+# ONNX session (150x faster) — prefer no_dft variant if available
+ONNX_PERCH_PATH = next(INPUT_ROOT.glob("**/perch_v2_no_dft*.onnx"),
+                   next(INPUT_ROOT.glob("**/perch_v2*.onnx"), Path("")))
 USE_ONNX = _ONNX_AVAILABLE and ONNX_PERCH_PATH.exists()
 
 if USE_ONNX:
@@ -837,6 +844,12 @@ print("✅ CHANGE 1: Upgraded MLP probe (pca_dim=64, hidden=(128,64), max_iter=3
 # ── Cell 7f-2: Vectorized MLP probe inference ──────────────────────────
 import torch
 import torch.nn as nn
+
+torch.manual_seed(42)
+torch.backends.cudnn.deterministic = True
+torch.backends.cudnn.benchmark = False
+seed_everything(42)
+print("✅ seed_everything(42) applied")
 
 class VectorizedMLPProbes(nn.Module):
     """Stacks all per-class MLP weights into a single batched PyTorch model.
@@ -1966,6 +1979,10 @@ final_scores    = (first_pass_flat
 print(f"Correction applied — "
       f"mean_abs={np.abs(correction_flat).mean():.4f}  "
       f"score range [{final_scores.min():.3f}, {final_scores.max():.3f}]")
+
+del emb_tr_f, sc_tr_f, proto_model, res_model
+gc.collect()
+print("Memory freed. Ready for SED cell.")
 
 # ── Step G: Temperature scaling ────────────────────────────────────────
 final_scores = final_scores / temperatures[None, :]
