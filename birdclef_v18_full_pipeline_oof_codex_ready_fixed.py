@@ -355,11 +355,17 @@ print("✅ Perch inference engine (ONNX + multithreaded I/O) defined")
 print(f"USE_ONNX = {USE_ONNX}  "
       f"(cache will be built with {'ONNX' if USE_ONNX else 'TF SavedModel'})")
 
-# ── Candidate external cache locations (add your own paths here) ──────
+# ── Candidate external cache locations ────────────────────────────────
+# Priority order: first match wins.
+# To reuse a previously built cache across sessions:
+#   1. After a run, go to Kaggle notebook → Output → "Save as Dataset"
+#   2. Mount that dataset as input in the next run
+#   3. Add its path here (e.g. "/kaggle/input/datasets/<user>/perch-cache-bc2026")
 EXTERNAL_CACHE_DIRS = [
     Path("/kaggle/input/notebooks/vyankteshdwivedi/notebook1b25083f0d"),
     Path("/kaggle/input/datasets/jaejohn/perch-meta"),
-    # add more here if needed
+    # ── Add your own saved cache dataset path below ──────────────────
+    # Path("/kaggle/input/datasets/<your-username>/birdclef2026-perch-cache"),
 ]
 
 CACHE_META_LOCAL = WORK_DIR / "perch_meta.parquet"
@@ -370,6 +376,7 @@ def _find_external_cache():
         meta = d / "perch_meta.parquet"
         npz  = d / "perch_arrays.npz"
         if meta.exists() and npz.exists():
+            print(f"  Found external cache: {d}")
             return meta, npz
     return None, None
 
@@ -417,7 +424,15 @@ def _build_cache():
         embs=emb_built.astype(np.float32),
         primary_labels=np.array(PRIMARY_LABELS),
     )
-    print(f"  Cache saved to {WORK_DIR}")
+    elapsed = time.time() - t0
+    print(f"  Cache saved to {WORK_DIR}  ({elapsed:.1f}s)")
+    print(
+        f"\n  *** To skip this {elapsed:.0f}s build in future runs: ***\n"
+        f"  1. Kaggle notebook → Output → [Save Version] → tick 'Save output'\n"
+        f"  2. Go to the output dataset → 'New Dataset from output'\n"
+        f"  3. Note the dataset slug, add it to EXTERNAL_CACHE_DIRS at the top\n"
+        f"  Files to include: {CACHE_META_LOCAL.name}, {CACHE_NPZ_LOCAL.name}\n"
+    )
     return CACHE_META_LOCAL, CACHE_NPZ_LOCAL
 
 # ── Priority: external > local working > build ────────────────────────
@@ -735,13 +750,13 @@ def build_sequential_features(scores_col, n_windows=12):
     return prev.reshape(-1), next_.reshape(-1), mean, max_, std
 
 
-def train_mlp_probes(emb, scores_raw, Y, min_pos=5, pca_dim=64, alpha_blend=0.4):
+def train_mlp_probes(emb, scores_raw, Y, min_pos=3, pca_dim=64, alpha_blend=0.4):
     """
     CHANGE 1: Upgraded MLP probe.
     - pca_dim: 32 → 64  (more embedding information)
     - hidden:  (32,) → (128, 64)  (more capacity)
     - max_iter: 100 → 300  (longer training)
-    - min_pos: 8 → 5  (catches more rare species)
+    - min_pos: 8 → 5 → 3  (catches more rare species with ≥3 positive windows)
     """
     # Step 1: Compress embeddings
     scaler = StandardScaler()
@@ -818,7 +833,7 @@ def apply_mlp_probes(emb_test, scores_test, probe_models, scaler, pca, alpha_ble
         result[:, ci] = (1 - alpha_blend) * scores_test[:, ci] + alpha_blend * logit
     return result
 
-print("✅ CHANGE 1: Upgraded MLP probe (pca_dim=64, hidden=(128,64), max_iter=300, min_pos=5)")
+print("✅ CHANGE 1: Upgraded MLP probe (pca_dim=64, hidden=(128,64), max_iter=300, min_pos=3)")
 # ── Cell 7f-2: Vectorized MLP probe inference ──────────────────────────
 import torch
 import torch.nn as nn
@@ -1751,7 +1766,7 @@ def run_pipeline_oof(emb_full, sc_full, Y_full, meta_full, n_splits=5):
             emb_tr_f,
             sc_tr_f,
             Y_tr_f,
-            min_pos=5,
+            min_pos=3,
             pca_dim=64,
             alpha_blend=0.4,
         )
@@ -1857,7 +1872,7 @@ sc_te_adjusted = apply_prior(
 # ── Step D: MLP probes ─────────────────────────────────────────────────
 probe_models, emb_scaler, emb_pca, alpha_blend = train_mlp_probes(
     emb=emb_tr, scores_raw=sc_tr, Y=Y_FULL_aligned,
-    min_pos=5, pca_dim=64, alpha_blend=0.4,
+    min_pos=3, pca_dim=64, alpha_blend=0.4,
 )
 sc_te_adjusted = apply_mlp_probes_vectorized(
     emb_te, sc_te_adjusted,
