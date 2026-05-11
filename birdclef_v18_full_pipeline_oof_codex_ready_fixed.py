@@ -193,8 +193,11 @@ print(f"Partial files (≥1 labeled window): {len(partial_files)} "
 birdclassifier = tf.saved_model.load(str(MODEL_DIR))
 infer_fn       = birdclassifier.signatures["serving_default"]
 
-# ONNX session (150x faster)
-ONNX_PERCH_PATH = Path("/kaggle/input/datasets/rishikeshjani/perch-onnx-for-birdclef-2026/perch_v2.onnx")
+# ONNX session — prefer no-DFT variant (better CPU numerical stability)
+ONNX_PERCH_PATH = next(
+    INPUT_ROOT.glob("**/perch_v2_no_dft*.onnx"),
+    next(INPUT_ROOT.glob("**/perch_v2*.onnx"), Path(""))
+)
 USE_ONNX = _ONNX_AVAILABLE and ONNX_PERCH_PATH.exists()
 
 if USE_ONNX:
@@ -204,7 +207,7 @@ if USE_ONNX:
                                             providers=["CPUExecutionProvider"])
     ONNX_INPUT_NAME = ONNX_SESSION.get_inputs()[0].name
     ONNX_OUT_MAP    = {o.name: i for i, o in enumerate(ONNX_SESSION.get_outputs())}
-    print("Using ONNX Perch (150x faster)")
+    print(f"Using ONNX Perch: {ONNX_PERCH_PATH.name}")
 else:
     print("Using TF SavedModel Perch")
 
@@ -1109,51 +1112,42 @@ def rank_aware_scaling(probs, n_windows=12, power=0.4):
 
 print("✅ Rank-aware scaling defined")
 
-# ── Per-class blend weight optimizer ──────────────────────────────────────
-def optimize_per_class_blend(proto_flat, mlp_flat, Y_labels, n_windows=12,
-                              grid=None):
+# ── Per-class blend weight (domain-knowledge based) ───────────────────────
+def build_per_class_blend_weights(primary_labels, mapped_mask, proxy_map,
+                                   class_name_map):
     """
-    For each class find the ProtoSSM weight w* in [0.2, 0.8] that maximises
-    AUC on training-data file-max aggregation.
+    Assign per-class ProtoSSM blend weight using domain knowledge rather than
+    training-set AUC (which is biased because MLP probes are directly fitted to
+    binary labels while ProtoSSM is trained with Focal+Mixup distillation).
 
-    Uses training labels directly (no holdout), so treat results as a
-    direction hint rather than an absolute calibration.  Smoothed toward 0.5
-    to guard against noise on rare classes.
+    Logic:
+      0.60  — Directly mapped to Perch (Aves, reliable logit signal)
+      0.55  — Directly mapped, non-Aves (weaker Perch prior)
+      0.50  — Proxy-mapped (genus-level match, noisier signal)
+      0.40  — Unmapped, no Perch signal (MLP embedding more informative)
     """
-    if grid is None:
-        grid = np.linspace(0.2, 0.8, 7, dtype=np.float32)
+    n_cls = len(primary_labels)
+    proxy_idx = set(proxy_map.keys())
+    weights   = np.full(n_cls, 0.50, dtype=np.float32)
 
-    n_cls  = Y_labels.shape[1]
-    n_files = len(proto_flat) // n_windows
+    for ci, label in enumerate(primary_labels):
+        cls = class_name_map.get(label, "Aves")
+        if mapped_mask[ci]:
+            weights[ci] = 0.60 if cls == "Aves" else 0.55
+        elif ci in proxy_idx:
+            weights[ci] = 0.50
+        else:
+            weights[ci] = 0.40
 
-    proto_f = proto_flat.reshape(n_files, n_windows, n_cls).max(axis=1)
-    mlp_f   = mlp_flat.reshape(n_files, n_windows, n_cls).max(axis=1)
-    Y_f     = Y_labels.reshape(n_files, n_windows, n_cls).max(axis=1)
-
-    per_class_w = np.full(n_cls, 0.5, dtype=np.float32)
-    n_optimized = 0
-    for c in range(n_cls):
-        y_true = Y_f[:, c]
-        if y_true.sum() < 3:
-            continue
-        best_auc, best_w = -1.0, 0.5
-        for w in grid:
-            blend = w * proto_f[:, c] + (1.0 - w) * mlp_f[:, c]
-            try:
-                auc = roc_auc_score(y_true, blend)
-                if auc > best_auc:
-                    best_auc, best_w = auc, float(w)
-            except Exception:
-                pass
-        # Shrink toward 0.5 (global) to avoid over-specialising on few samples
-        shrink = min(1.0, y_true.sum() / 10.0)
-        per_class_w[c] = shrink * best_w + (1.0 - shrink) * 0.5
-        n_optimized += 1
-
-    print(f"Per-class blend: optimized {n_optimized} classes | "
-          f"mean={per_class_w.mean():.3f}  "
-          f"range=[{per_class_w.min():.2f}, {per_class_w.max():.2f}]")
-    return per_class_w
+    n_direct  = int(mapped_mask.sum())
+    n_proxy   = len(proxy_idx)
+    n_none    = n_cls - n_direct - n_proxy
+    print(f"Per-class blend weights: "
+          f"{n_direct} direct (0.55–0.60) | "
+          f"{n_proxy} proxy (0.50) | "
+          f"{n_none} no-signal (0.40) | "
+          f"mean={weights.mean():.3f}")
+    return weights
 
 # ── Cell 7h: Adaptive delta smoothing ─────────────────────────────────
 def adaptive_delta_smooth(probs, n_windows=12, base_alpha=0.20):
@@ -2050,9 +2044,9 @@ sc_tr_mlp = apply_mlp_probes_vectorized(
     probe_models, emb_scaler, emb_pca, alpha_blend,
 )
 
-# ── Per-class blend weight optimization (replaces fixed ENSEMBLE_W=0.5) ──
-per_class_w = optimize_per_class_blend(
-    proto_tr_flat, sc_tr_mlp, Y_FULL_aligned, n_windows=N_WINDOWS)
+# ── Per-class blend weights (domain-knowledge based, no train-set bias) ──
+per_class_w = build_per_class_blend_weights(
+    PRIMARY_LABELS, MAPPED_MASK, proxy_map, CLASS_NAME_MAP)
 
 # Apply per-class blend to TEST
 first_pass_flat = (per_class_w[None, :] * proto_scores_flat
