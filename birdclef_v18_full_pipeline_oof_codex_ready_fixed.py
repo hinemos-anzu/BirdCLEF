@@ -1108,6 +1108,53 @@ def rank_aware_scaling(probs, n_windows=12, power=0.4):
 
 
 print("✅ Rank-aware scaling defined")
+
+# ── Per-class blend weight optimizer ──────────────────────────────────────
+def optimize_per_class_blend(proto_flat, mlp_flat, Y_labels, n_windows=12,
+                              grid=None):
+    """
+    For each class find the ProtoSSM weight w* in [0.2, 0.8] that maximises
+    AUC on training-data file-max aggregation.
+
+    Uses training labels directly (no holdout), so treat results as a
+    direction hint rather than an absolute calibration.  Smoothed toward 0.5
+    to guard against noise on rare classes.
+    """
+    if grid is None:
+        grid = np.linspace(0.2, 0.8, 7, dtype=np.float32)
+
+    n_cls  = Y_labels.shape[1]
+    n_files = len(proto_flat) // n_windows
+
+    proto_f = proto_flat.reshape(n_files, n_windows, n_cls).max(axis=1)
+    mlp_f   = mlp_flat.reshape(n_files, n_windows, n_cls).max(axis=1)
+    Y_f     = Y_labels.reshape(n_files, n_windows, n_cls).max(axis=1)
+
+    per_class_w = np.full(n_cls, 0.5, dtype=np.float32)
+    n_optimized = 0
+    for c in range(n_cls):
+        y_true = Y_f[:, c]
+        if y_true.sum() < 3:
+            continue
+        best_auc, best_w = -1.0, 0.5
+        for w in grid:
+            blend = w * proto_f[:, c] + (1.0 - w) * mlp_f[:, c]
+            try:
+                auc = roc_auc_score(y_true, blend)
+                if auc > best_auc:
+                    best_auc, best_w = auc, float(w)
+            except Exception:
+                pass
+        # Shrink toward 0.5 (global) to avoid over-specialising on few samples
+        shrink = min(1.0, y_true.sum() / 10.0)
+        per_class_w[c] = shrink * best_w + (1.0 - shrink) * 0.5
+        n_optimized += 1
+
+    print(f"Per-class blend: optimized {n_optimized} classes | "
+          f"mean={per_class_w.mean():.3f}  "
+          f"range=[{per_class_w.min():.2f}, {per_class_w.max():.2f}]")
+    return per_class_w
+
 # ── Cell 7h: Adaptive delta smoothing ─────────────────────────────────
 def adaptive_delta_smooth(probs, n_windows=12, base_alpha=0.20):
     """
@@ -1451,13 +1498,22 @@ def train_light_proto_ssm(
     for ep in range(n_epochs):
         model.train()
 
-        out = model(emb_t, log_t, site_ids=site_t, hours=hour_t)
+        # Mixup augmentation: only in the main-training phase (not SWA)
+        if ep < swa_start:
+            lam = float(np.random.beta(0.4, 0.4))
+            idx = torch.randperm(emb_t.size(0))
+            emb_in = lam * emb_t + (1 - lam) * emb_t[idx]
+            log_in = lam * log_t + (1 - lam) * log_t[idx]
+            lab_in = lam * lab_t + (1 - lam) * lab_t[idx]
+        else:
+            emb_in, log_in, lab_in = emb_t, log_t, lab_t
 
+        out = model(emb_in, log_in, site_ids=site_t, hours=hour_t)
+
+        # Focal BCE (gamma=2.5) + distillation MSE
         loss = (
-            F.binary_cross_entropy_with_logits(
-                out, lab_t, pos_weight=pos_weight[None, None, :]
-            )
-            + 0.15 * F.mse_loss(out, log_t)
+            _focal_bce(out, lab_in, pos_weight[None, None, :], gamma=2.5)
+            + 0.15 * F.mse_loss(out, log_in)
         )
 
         opt.zero_grad()
@@ -1500,6 +1556,15 @@ def train_light_proto_ssm(
 
 
 print("✅ CHANGE 4: LightProtoSSM with cross-attention (2 heads) defined")
+
+# ── Focal BCE helper ───────────────────────────────────────────────────────
+def _focal_bce(logits, targets, pos_weight, gamma=2.5):
+    """Down-weights easy negatives to focus learning on hard examples."""
+    bce = F.binary_cross_entropy_with_logits(
+        logits, targets, pos_weight=pos_weight, reduction='none')
+    prob = torch.sigmoid(logits.detach())
+    pt   = torch.where(targets > 0.5, prob, 1.0 - prob)
+    return (((1.0 - pt) ** gamma) * bce).mean()
 # ── Cell 7i-2: TTA — Circular Shift Test-Time Augmentation ───────────
 # CHANGE 3: Average ProtoSSM predictions across 5 time shifts
 # Expected gain: +0.003–0.005 on public LB
@@ -1950,13 +2015,7 @@ sc_te_adjusted = apply_mlp_probes_vectorized(
     probe_models, emb_scaler, emb_pca, alpha_blend,
 )
 
-# ── Step E: First-pass ensemble (ProtoSSM + MLP) ───────────────────────
-ENSEMBLE_W      = 0.5
-first_pass_flat = (ENSEMBLE_W * proto_scores_flat
-                   + (1.0 - ENSEMBLE_W) * sc_te_adjusted)
-
-# ── Step F: ResidualSSM (second-pass correction) ───────────────────────
-# Build training-data first-pass scores for residual training
+# ── Step E: Build training-data branch scores for blend optimization ───
 n_tr_files    = len(sc_tr) // N_WINDOWS
 emb_tr_f      = emb_tr.reshape(n_tr_files, N_WINDOWS, -1)
 sc_tr_f       = sc_tr.reshape(n_tr_files, N_WINDOWS, -1)
@@ -1971,19 +2030,14 @@ tr_hour_ids   = np.array([
     int(meta_tr.loc[meta_tr["filename"]==fn,"hour_utc"].iloc[0]) % 24
     for fn in tr_fnames], dtype=np.int64)
 
-
-# Get ProtoSSM scores on training data
-# CORRECT — using emb_tr_f, sc_tr_f, tr_site_ids (train data)
-proto_tr_out = run_tta_proto(
+proto_tr_out  = run_tta_proto(
     proto_model, emb_tr_f, sc_tr_f,
     site_t=torch.tensor(tr_site_ids, dtype=torch.long),
     hour_t=torch.tensor(tr_hour_ids, dtype=torch.long),
     shifts=[0, 1, -1, 2, -2],
 )
-
 proto_tr_flat = proto_tr_out.reshape(-1, N_CLASSES).astype(np.float32)
 
-# Get MLP scores on training data
 sc_tr_prior   = apply_prior(
     sc_tr,
     sites=meta_tr["site"].to_numpy(),
@@ -1995,8 +2049,20 @@ sc_tr_mlp = apply_mlp_probes_vectorized(
     emb_tr, sc_tr_prior,
     probe_models, emb_scaler, emb_pca, alpha_blend,
 )
-first_pass_tr = (ENSEMBLE_W * proto_tr_flat
-                 + (1.0 - ENSEMBLE_W) * sc_tr_mlp)
+
+# ── Per-class blend weight optimization (replaces fixed ENSEMBLE_W=0.5) ──
+per_class_w = optimize_per_class_blend(
+    proto_tr_flat, sc_tr_mlp, Y_FULL_aligned, n_windows=N_WINDOWS)
+
+# Apply per-class blend to TEST
+first_pass_flat = (per_class_w[None, :] * proto_scores_flat
+                   + (1.0 - per_class_w[None, :]) * sc_te_adjusted)
+
+# Apply same per-class blend to TRAIN (for ResidualSSM target)
+first_pass_tr   = (per_class_w[None, :] * proto_tr_flat
+                   + (1.0 - per_class_w[None, :]) * sc_tr_mlp)
+
+# ── Step F: ResidualSSM (second-pass correction) ───────────────────────
 
 train_probs_for_calib = sigmoid(first_pass_tr)
 PER_CLASS_THRESHOLDS = calibrate_and_optimize_thresholds(
@@ -2060,15 +2126,194 @@ probs = np.clip(probs, 0.0, 1.0)
 probs = apply_per_class_thresholds(probs, PER_CLASS_THRESHOLDS)
 
 # ── Step J: Build submission ───────────────────────────────────────────
-sub = pd.DataFrame(probs.astype(np.float32), columns=PRIMARY_LABELS)
-sub.insert(0, "row_id", meta_te["row_id"].values)
-assert list(sub.columns) == ["row_id"] + PRIMARY_LABELS
-assert len(sub) == len(test_paths) * N_WINDOWS
-assert not sub.isna().any().any()
-sub.to_csv("submission.csv", index=False)
+sub_proto = pd.DataFrame(probs.astype(np.float32), columns=PRIMARY_LABELS)
+sub_proto.insert(0, "row_id", meta_te["row_id"].values)
+assert list(sub_proto.columns) == ["row_id"] + PRIMARY_LABELS
+assert len(sub_proto) == len(test_paths) * N_WINDOWS
+assert not sub_proto.isna().any().any()
+sub_proto.to_csv("submission_protossm.csv", index=False)
 
-print(f"\nsubmission.csv saved — shape {sub.shape}")
-print(f"Total wall time: {(time.time() - _WALL_START)/60:.1f} min")
+print(f"\nsubmission_protossm.csv saved — shape {sub_proto.shape}")
+print(f"ProtoSSM wall time: {(time.time() - _WALL_START)/60:.1f} min")
+
+# ── SED Branch ─────────────────────────────────────────────────────────────
+# Requires dataset: tuckerarrants/bc2026-distilled-sed-public
+# (Public Kaggle dataset — attach to notebook before running)
+# If not found, ProtoSSM result is copied to submission.csv as fallback.
+
+import importlib.util, re as _re2
+_HAS_LIBROSA = importlib.util.find_spec("librosa") is not None
+
+def _find_sed_onnx_dir():
+    for p in INPUT_ROOT.rglob("sed_fold0.onnx"):
+        return p.parent
+    return None
+
+_SED_DIR = _find_sed_onnx_dir()
+_HAS_SED = _HAS_LIBROSA and (_SED_DIR is not None) and _ONNX_AVAILABLE
+
+if _HAS_SED:
+    import librosa
+    from scipy.ndimage import gaussian_filter1d
+
+    N_MELS_SED = 256
+    N_FFT_SED  = 2048
+    HOP_SED    = 512
+    FMIN_SED   = 20
+    FMAX_SED   = 16000
+    TOP_DB_SED = 80
+
+    def _make_sed_session(path):
+        so = ort.SessionOptions()
+        so.intra_op_num_threads = 4
+        so.inter_op_num_threads = 1
+        so.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
+        return ort.InferenceSession(str(path), sess_options=so,
+                                    providers=["CPUExecutionProvider"])
+
+    def _audio_to_mel(chunks):
+        mels = []
+        for x in chunks:
+            s = librosa.feature.melspectrogram(
+                y=x, sr=SR, n_fft=N_FFT_SED, hop_length=HOP_SED,
+                n_mels=N_MELS_SED, fmin=FMIN_SED, fmax=FMAX_SED, power=2.0)
+            s = librosa.power_to_db(s, top_db=TOP_DB_SED)
+            s = (s - s.mean()) / (s.std() + 1e-6)
+            mels.append(s)
+        return np.stack(mels)[:, None].astype(np.float32)
+
+    def _file_to_sed_chunks(path):
+        y, sr0 = sf.read(str(path), dtype="float32", always_2d=False)
+        if y.ndim == 2: y = y.mean(axis=1)
+        if sr0 != SR: y = librosa.resample(y, orig_sr=sr0, target_sr=SR)
+        n = 60 * SR
+        if len(y) < n: y = np.pad(y, (0, n - len(y)))
+        else:          y = y[:n]
+        chunks = y.reshape(N_WINDOWS, WINDOW_SAMPLES)
+        ends   = np.arange(1, N_WINDOWS + 1) * WINDOW_SEC
+        return chunks, ends
+
+    def _sigmoid_sed(x):
+        return (1.0 / (1.0 + np.exp(-np.clip(x, -50, 50)))).astype(np.float32)
+
+    sed_fold_paths = sorted(
+        _SED_DIR.glob("sed_fold*.onnx"),
+        key=lambda p: int(_re2.search(r"sed_fold(\d+)", p.name).group(1))
+    )
+    sed_sessions = [_make_sed_session(p) for p in sed_fold_paths]
+    print(f"SED folds loaded: {[p.name for p in sed_fold_paths]}")
+
+    sed_rows, sed_preds = [], []
+    for i, path in enumerate(test_paths, 1):
+        chunks, ends = _file_to_sed_chunks(path)
+        mel   = _audio_to_mel(chunks)
+        p_sum = np.zeros((len(chunks), N_CLASSES), dtype=np.float32)
+        for sess in sed_sessions:
+            outs        = sess.run(None, {sess.get_inputs()[0].name: mel})
+            clip_logits = outs[0]
+            frame_max   = outs[1].max(axis=1)
+            p_sum += 0.5 * _sigmoid_sed(clip_logits) + 0.5 * _sigmoid_sed(frame_max)
+        p_mean = p_sum / max(len(sed_sessions), 1)
+        if len(p_mean) > 1:
+            p_mean = gaussian_filter1d(p_mean, sigma=0.65, axis=0,
+                                       mode="nearest").astype(np.float32)
+        stem = path.stem
+        sed_rows.extend([f"{stem}_{int(t)}" for t in ends])
+        sed_preds.append(p_mean)
+        if i == 1 or i % 50 == 0 or i == len(test_paths):
+            print(f"SED: {i}/{len(test_paths)}")
+
+    sed_preds_arr = np.concatenate(sed_preds, axis=0)
+    sub_sed = pd.DataFrame(np.clip(sed_preds_arr, 0.0, 1.0), columns=PRIMARY_LABELS)
+    sub_sed.insert(0, "row_id", sed_rows)
+    sub_sed.to_csv("submission_sed.csv", index=False)
+    print(f"SED complete — shape {sub_sed.shape}")
+
+    # ── 60/40 Rank-percentile blend + 5-gate refinement ────────────────────
+    EPS = 1e-5
+    cols = PRIMARY_LABELS
+    sub_sed_aligned = sub_sed.set_index("row_id").loc[sub_proto["row_id"]].reset_index()
+
+    p_proto = np.clip(sub_proto[cols].to_numpy(np.float32), EPS, 1 - EPS)
+    p_sed   = np.clip(sub_sed_aligned[cols].to_numpy(np.float32), EPS, 1 - EPS)
+
+    rank_proto = pd.DataFrame(p_proto).rank(axis=0, pct=True).to_numpy(np.float32)
+    rank_sed   = pd.DataFrame(p_sed).rank(axis=0, pct=True).to_numpy(np.float32)
+
+    # Base blend: 60% ProtoSSM + 40% SED
+    pred = rank_proto * 0.60 + rank_sed * 0.40
+
+    row_ids_bl = sub_proto["row_id"].astype(str).to_numpy()
+    file_ids   = np.array(["_".join(r.split("_")[:-1]) for r in row_ids_bl])
+
+    # Gate 1: Noise suppression (ProtoSSM confident but SED strongly disagrees)
+    fake_only = (p_proto > 0.50) & (p_sed < 0.05)
+    pred = np.where(fake_only, (1.0 - 0.08) * pred + 0.08 * rank_proto, pred)
+
+    # Gate 2: Temporal continuity (t-distribution kernel, 35s context)
+    offs         = np.arange(-3, 4, dtype=np.float32)
+    t_kernel     = (1.0 + (offs / 1.20) ** 2 / 2.0) ** (-1.5)
+    t_kernel     = (t_kernel / t_kernel.sum()).astype(np.float32)
+    pa_ctx       = p_proto.copy()
+    for fid in pd.unique(file_ids):
+        m  = file_ids == fid
+        xp = np.pad(p_proto[m], ((3, 3), (0, 0)), mode="edge")
+        pa_ctx[m] = sum(t_kernel[i] * xp[i:i + m.sum()] for i in range(7))
+    xctx = pd.DataFrame(pa_ctx).rank(axis=0, pct=True).to_numpy(np.float32)
+    proto_cont = (xctx > 0.88) & (rank_proto > 0.75) & (p_sed < 0.12) & (~fake_only)
+    pred = np.where(proto_cont,
+                    (1.0 - 0.15) * pred + 0.15 * np.maximum(rank_proto, xctx),
+                    pred)
+
+    # Gate 3: SED spike preservation (brief high-confidence SED detections)
+    sed_only = (rank_sed > 0.95) & (rank_proto < 0.80) & (~fake_only) & (~proto_cont)
+    pred = np.where(sed_only, (1.0 - 0.12) * pred + 0.12 * rank_sed, pred)
+
+    sub_blend = sub_proto.copy()
+    sub_blend[cols] = pred.astype(np.float32)
+
+    # Gate 4: Sonotype mirroring (max-pool acoustically identical species groups)
+    MIRROR_PAIRS = (
+        ("47158son15", "47158son16"),
+        ("47158son09", "47158son12"),
+        ("47158son02", "47158son14"),
+        ("47158son13", "47158son21", "47158son22", "47158son23"),
+    )
+    col_to_idx_bl = {lbl: i for i, lbl in enumerate(cols)}
+    for group in MIRROR_PAIRS:
+        valid_idx = [col_to_idx_bl[s] for s in group if s in col_to_idx_bl]
+        if len(valid_idx) >= 2:
+            grp_max = sub_blend[cols].iloc[:, valid_idx].max(axis=1).to_numpy(np.float32)
+            for idx in valid_idx:
+                sub_blend.iloc[:, idx + 1] = grp_max
+
+    # Gate 5: Adaptive rare-class thresholding (Amphibia, Mammalia, Reptilia)
+    try:
+        tax_df     = pd.read_csv(BASE / "taxonomy.csv").set_index("primary_label")
+        rare_taxa  = {"Amphibia", "Mammalia", "Reptilia"}
+        rare_count = 0
+        for ci, species in enumerate(cols):
+            if species in tax_df.index and tax_df.loc[species, "class_name"] in rare_taxa:
+                vals = sub_blend.iloc[:, ci + 1].to_numpy(np.float32)
+                thr  = vals.mean() + 0.05
+                sub_blend.iloc[:, ci + 1] = np.where(vals < thr, vals * 0.9, vals)
+                rare_count += 1
+        print(f"Rare-class thresholding: {rare_count} species adjusted")
+    except Exception as e:
+        print(f"Rare-class thresholding skipped: {e}")
+
+    sub_blend.to_csv("submission.csv", index=False)
+    print(f"Blend complete — submission.csv shape {sub_blend.shape}")
+
+else:
+    # SED not available — use ProtoSSM result directly
+    reason = ("librosa not installed" if not _HAS_LIBROSA
+              else "SED ONNX not found (attach tuckerarrants/bc2026-distilled-sed-public)"
+              if _SED_DIR is None else "ONNX Runtime unavailable")
+    print(f"SED branch skipped ({reason}) — copying ProtoSSM result to submission.csv")
+    sub_proto.to_csv("submission.csv", index=False)
+
+print(f"\nTotal wall time: {(time.time() - _WALL_START)/60:.1f} min")
 
  
  
