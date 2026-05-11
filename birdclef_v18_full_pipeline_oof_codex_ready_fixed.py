@@ -83,11 +83,11 @@ CFG = {
 
     # V18 proto_ssm
     "proto_ssm_train": {
-        "n_epochs":        80  if MODE == "train" else 40,
+        "n_epochs":        80  if MODE == "train" else 60,
         "lr":              8e-4,
         "weight_decay":    1e-3,
         "val_ratio":       0.15,
-        "patience":        20  if MODE == "train" else 8,
+        "patience":        20  if MODE == "train" else 12,
         "pos_weight_cap":  25.0,
         "distill_weight":  0.15,
         "proto_margin":    0.15,
@@ -180,6 +180,15 @@ Y_FULL = Y_SC[full_rows["index"].to_numpy()]
  
 print(f"Classes: {N_CLASSES} | Fully-labeled files: {len(full_files)}")
 print(f"Full-file windows: {len(full_rows)} | Active classes: {int((Y_FULL.sum(0) > 0).sum())}")
+
+# ── Partial-file detection (files with 1 ≤ labeled windows < 12) ──────────
+partial_files = sorted(
+    windows_per_file[
+        (windows_per_file > 0) & (windows_per_file < N_WINDOWS)
+    ].index.tolist()
+)
+print(f"Partial files (≥1 labeled window): {len(partial_files)} "
+      f"— will supplement MLP probe training")
 # ── Cell 4: Load Perch model (ONNX preferred) ─────────────────────────
 birdclassifier = tf.saved_model.load(str(MODEL_DIR))
 infer_fn       = birdclassifier.signatures["serving_default"]
@@ -248,7 +257,7 @@ for _, row in unmapped_df.iterrows():
         proxy_map[label_to_idx[target]] = hits["bc_index"].astype(int).tolist()
 
 # Only use proxies for biologically meaningful taxa
-PROXY_TAXA = {"Amphibia", "Insecta", "Aves"}
+PROXY_TAXA = {"Amphibia", "Insecta", "Aves", "Mammalia", "Reptilia"}
 proxy_map  = {
     idx: bc_idxs
     for idx, bc_idxs in proxy_map.items()
@@ -493,6 +502,81 @@ if len(meta_tr) != expected_rows:
 
 print(f"sc_tr: {sc_tr.shape}  emb_tr: {emb_tr.shape}  "
       f"Y_FULL_aligned: {Y_FULL_aligned.shape}")
+
+# ── Supplement cache with partial-file embeddings (for MLP training) ────────
+# Partial files contribute labeled windows without affecting ProtoSSM/ResidualSSM
+# (those still train on full files only).
+PARTIAL_CACHE_META_P = WORK_DIR / "perch_meta_partial.parquet"
+PARTIAL_CACHE_NPZ_P  = WORK_DIR / "perch_arrays_partial.npz"
+
+def _load_or_build_partial_cache(files_list):
+    paths = [BASE / "train_soundscapes" / fn for fn in files_list
+             if (BASE / "train_soundscapes" / fn).exists()]
+    if not paths:
+        return None, None, None
+    if PARTIAL_CACHE_META_P.exists() and PARTIAL_CACHE_NPZ_P.exists():
+        print(f"  Loading partial-file Perch cache ({len(paths)} files)")
+        meta_p = pd.read_parquet(PARTIAL_CACHE_META_P)
+        _ap    = np.load(PARTIAL_CACHE_NPZ_P)
+        return meta_p, _ap["scores"].astype(np.float32), _ap["embs"].astype(np.float32)
+    print(f"  Building partial-file Perch cache from {len(paths)} files…")
+    meta_p, sc_p, emb_p = run_perch(paths, CFG["batch_files"], verbose=True)
+    meta_p.to_parquet(PARTIAL_CACHE_META_P)
+    np.savez(PARTIAL_CACHE_NPZ_P,
+             scores=sc_p.astype(np.float32), embs=emb_p.astype(np.float32))
+    print(f"  Partial cache saved  scores={sc_p.shape}")
+    return meta_p, sc_p, emb_p
+
+if partial_files:
+    t_part = time.time()
+    meta_part, sc_part, emb_part = _load_or_build_partial_cache(partial_files)
+
+    if meta_part is not None:
+        # Ensure row_id column exists
+        if "row_id" not in meta_part.columns:
+            n_pf = len(meta_part) // N_WINDOWS
+            meta_part["row_id"] = (
+                meta_part["filename"].str.replace(".ogg", "", regex=False)
+                + "_" + np.tile(np.arange(5, 65, 5), n_pf).astype(str)
+            )
+
+        # Build label lookup for partial-file windows
+        partial_sc = sc[sc["filename"].isin(set(partial_files))]
+        part_rid_map = {row["row_id"]: row["label_list"]
+                        for _, row in partial_sc.iterrows()}
+
+        # Label matrix + validity mask for partial windows
+        Y_part    = np.zeros((len(meta_part), N_CLASSES), dtype=np.uint8)
+        mask_part = np.zeros(len(meta_part), dtype=bool)
+        for i, rid in enumerate(meta_part["row_id"].values):
+            if rid in part_rid_map:
+                for lbl in part_rid_map[rid]:
+                    if lbl in label_to_idx:
+                        Y_part[i, label_to_idx[lbl]] = 1
+                mask_part[i] = True
+
+        # Extended arrays: full files first, partial files appended
+        meta_tr_ext = pd.concat([meta_tr, meta_part], ignore_index=True)
+        sc_tr_ext   = np.concatenate([sc_tr,  sc_part],  axis=0)
+        emb_tr_ext  = np.concatenate([emb_tr, emb_part], axis=0)
+        Y_tr_ext    = np.concatenate([Y_FULL_aligned, Y_part], axis=0)
+        mask_tr_ext = np.concatenate(
+            [np.ones(len(Y_FULL_aligned), dtype=bool), mask_part], axis=0
+        )
+        n_labeled = int(mask_tr_ext.sum())
+        print(f"Extended training: {len(sc_tr_ext)} windows | "
+              f"{n_labeled} labeled | "
+              f"Active classes: {int((Y_tr_ext[mask_tr_ext].sum(0) > 0).sum())}  "
+              f"({time.time()-t_part:.1f}s)")
+    else:
+        meta_tr_ext = meta_tr; sc_tr_ext = sc_tr; emb_tr_ext = emb_tr
+        Y_tr_ext = Y_FULL_aligned
+        mask_tr_ext = np.ones(len(Y_FULL_aligned), dtype=bool)
+else:
+    meta_tr_ext = meta_tr; sc_tr_ext = sc_tr; emb_tr_ext = emb_tr
+    Y_tr_ext = Y_FULL_aligned
+    mask_tr_ext = np.ones(len(Y_FULL_aligned), dtype=bool)
+    print("No partial files detected; using full-file data only")
 # ── Cell 7: Metric helpers ─────────────────────────────────────────────
 def macro_auc(y_true, y_score):
     """
@@ -551,90 +635,104 @@ print("✅ Temporal smoothing helper defined")
 # ── Cell 7c: Prior table builder ───────────────────────────────────────
 def build_prior_tables(sc_df, Y_labels):
     """
-    Build site-level and hour-level species frequency tables.
-    
-    These answer: "How often is species X observed at site S at hour H?"
-    
-    We use these as a soft prior: add them to raw Perch logits.
+    3-tier hierarchical prior: global → site+hour independent → site×hour joint.
+    Joint bucket uses tighter shrinkage (4.0 vs 8.0) to reflect finer granularity.
     """
     sc_df = sc_df.reset_index(drop=True)
-    global_p = Y_labels.mean(axis=0).astype(np.float32)  # overall frequency
-    
+    global_p = Y_labels.mean(axis=0).astype(np.float32)
+
     # ── Site-level frequencies ──────────────────────────────────────────
     site_keys = sorted(sc_df["site"].dropna().astype(str).unique())
     site_to_i = {k: i for i, k in enumerate(site_keys)}
     site_p    = np.zeros((len(site_keys), Y_labels.shape[1]), dtype=np.float32)
     site_n    = np.zeros(len(site_keys), dtype=np.float32)
-    
     for s in site_keys:
-        i     = site_to_i[s]
-        mask  = sc_df["site"].astype(str).values == s
+        i = site_to_i[s]
+        mask = sc_df["site"].astype(str).values == s
         site_n[i] = mask.sum()
         site_p[i] = Y_labels[mask].mean(axis=0)
-    
+
     # ── Hour-level frequencies ──────────────────────────────────────────
     hour_keys = sorted(sc_df["hour_utc"].dropna().astype(int).unique())
     hour_to_i = {h: i for i, h in enumerate(hour_keys)}
     hour_p    = np.zeros((len(hour_keys), Y_labels.shape[1]), dtype=np.float32)
     hour_n    = np.zeros(len(hour_keys), dtype=np.float32)
-    
     for h in hour_keys:
-        i     = hour_to_i[h]
-        mask  = sc_df["hour_utc"].astype(int).values == h
+        i = hour_to_i[h]
+        mask = sc_df["hour_utc"].astype(int).values == h
         hour_n[i] = mask.sum()
         hour_p[i] = Y_labels[mask].mean(axis=0)
-    
+
+    # ── Joint site×hour bucket (tighter shrinkage=4) ────────────────────
+    valid = sc_df["site"].notna() & sc_df["hour_utc"].notna()
+    sh_keys = sorted({
+        (str(s), int(h))
+        for s, h in zip(sc_df.loc[valid, "site"], sc_df.loc[valid, "hour_utc"])
+    })
+    sh_to_i = {k: i for i, k in enumerate(sh_keys)}
+    sh_p    = np.zeros((len(sh_keys), Y_labels.shape[1]), dtype=np.float32)
+    sh_n    = np.zeros(len(sh_keys), dtype=np.float32)
+    for (s, h) in sh_keys:
+        i = sh_to_i[(s, h)]
+        mask = (sc_df["site"].astype(str).values == s) & (sc_df["hour_utc"].astype(int).values == h)
+        sh_n[i] = mask.sum()
+        sh_p[i] = Y_labels[mask].mean(axis=0)
+
+    print(f"Prior tables: {len(site_keys)} sites | {len(hour_keys)} hours | "
+          f"{len(sh_keys)} site×hour buckets")
     return {
         "global_p": global_p,
         "site_to_i": site_to_i, "site_p": site_p, "site_n": site_n,
         "hour_to_i": hour_to_i, "hour_p": hour_p, "hour_n": hour_n,
+        "sh_to_i":   sh_to_i,   "sh_p":   sh_p,   "sh_n":   sh_n,
     }
 
 
 def apply_prior(scores, sites, hours, tables, lambda_prior=0.4):
     """
-    Add a scaled prior logit to the raw Perch scores.
-    
-    lambda_prior=0: no effect (your baseline)
-    lambda_prior=0.4: moderate influence from location/time
-    
-    The prior is converted to a logit (log-odds) before adding.
-    This is mathematically correct — you add logits, not probabilities.
+    3-tier prior fusion: global → hour/site (shrinkage=8) → site×hour (shrinkage=4).
+    Converts final probability estimate to logit and adds to raw scores.
     """
     eps = 1e-4
     n   = len(scores)
     out = scores.copy()
-    
-    # Start from global average
-    p = np.tile(tables["global_p"], (n, 1))  # (n, 234)
-    
-    # Override with hour-level estimate (if enough data)
+
+    # Tier 1: global baseline
+    p = np.tile(tables["global_p"], (n, 1))
+
+    # Tier 2a: hour-level refinement
     for i, h in enumerate(hours):
         h = int(h)
         if h in tables["hour_to_i"]:
-            j   = tables["hour_to_i"][h]
-            nh  = tables["hour_n"][j]
-            w   = nh / (nh + 8.0)   # shrink toward global if little data
+            j  = tables["hour_to_i"][h]
+            nh = tables["hour_n"][j]
+            w  = nh / (nh + 8.0)
             p[i] = w * tables["hour_p"][j] + (1 - w) * tables["global_p"]
-    
-    # Override with site-level estimate (if enough data)
+
+    # Tier 2b: site-level refinement (builds on hour estimate)
     for i, s in enumerate(sites):
         s = str(s)
         if s in tables["site_to_i"]:
-            j   = tables["site_to_i"][s]
-            ns  = tables["site_n"][j]
-            w   = ns / (ns + 8.0)   # same shrinkage logic
+            j  = tables["site_to_i"][s]
+            ns = tables["site_n"][j]
+            w  = ns / (ns + 8.0)
             p[i] = w * tables["site_p"][j] + (1 - w) * p[i]
-    
-    # Convert prior probability to logit and add
-    p      = np.clip(p, eps, 1 - eps)
-    logit_prior = np.log(p) - np.log1p(-p)
-    out   += lambda_prior * logit_prior
-    
+
+    # Tier 3: joint site×hour (finer shrinkage=4, builds on tier-2 estimate)
+    for i, (s, h) in enumerate(zip(sites, hours)):
+        key = (str(s), int(h))
+        if key in tables["sh_to_i"]:
+            j   = tables["sh_to_i"][key]
+            nsh = tables["sh_n"][j]
+            w   = nsh / (nsh + 4.0)
+            p[i] = w * tables["sh_p"][j] + (1 - w) * p[i]
+
+    p   = np.clip(p, eps, 1 - eps)
+    out += lambda_prior * (np.log(p) - np.log1p(-p))
     return out.astype(np.float32)
 
 
-print("✅ Prior table functions defined")
+print("✅ Prior tables: 3-tier joint site×hour prior defined")
 # ── Cell 7d: File-level confidence scaling ─────────────────────────────
 def file_confidence_scale(probs, n_windows=12, top_k=2, power=0.4):
     """
@@ -711,15 +809,17 @@ def build_sequential_features(scores_col, n_windows=12):
     return prev.reshape(-1), next_.reshape(-1), mean, max_, std
 
 
-def train_mlp_probes(emb, scores_raw, Y, min_pos=5, pca_dim=64, alpha_blend=0.4):
+def train_mlp_probes(emb, scores_raw, Y, label_mask=None, min_pos=5, pca_dim=128, alpha_blend=0.4):
     """
-    CHANGE 1: Upgraded MLP probe.
-    - pca_dim: 32 → 64  (more embedding information)
-    - hidden:  (32,) → (128, 64)  (more capacity)
-    - max_iter: 100 → 300  (longer training)
-    - min_pos: 8 → 5  (catches more rare species)
+    Train per-class MLP probes on PCA-compressed embeddings + sequential features.
+
+    label_mask: bool array (n_rows,) — True where labels are valid.
+                Allows mixing full files (all windows labeled) with partial files
+                (only some windows labeled). PCA/scaler are fit on ALL rows so
+                sequential context is preserved; only labeled rows are used for
+                MLP fitting.  If None, all rows are used (backward compatible).
+    pca_dim: 128 (was 64) — retains ~90%+ variance for rare-species discrimination.
     """
-    # Step 1: Compress embeddings
     scaler = StandardScaler()
     emb_s  = scaler.fit_transform(emb)
     pca    = PCA(n_components=min(pca_dim, emb_s.shape[1] - 1))
@@ -727,26 +827,38 @@ def train_mlp_probes(emb, scores_raw, Y, min_pos=5, pca_dim=64, alpha_blend=0.4)
     print(f"Embedding: {emb.shape} → PCA: {Z.shape}  "
           f"(variance retained: {pca.explained_variance_ratio_.sum():.2%})")
 
-    class_weights = build_class_freq_weights(Y, cap=10.0)
+    # Determine which rows are labeled (support partial files)
+    if label_mask is not None:
+        train_idx = np.where(label_mask)[0]
+    else:
+        train_idx = np.arange(len(Y))
+
+    Y_train       = Y[train_idx]
+    class_weights = build_class_freq_weights(Y_train, cap=10.0)
 
     probe_models = {}
-    active = np.where(Y.sum(axis=0) >= min_pos)[0]
-    print(f"Training MLP probes for {len(active)} species (>= {min_pos} pos windows)...")
+    active = np.where(Y_train.sum(axis=0) >= min_pos)[0]
+    print(f"Training MLP probes for {len(active)} species (>= {min_pos} pos windows, "
+          f"{len(train_idx)}/{len(Y)} labeled rows)...")
 
-    MAX_ROWS = 3000   # slightly higher budget for (128,64) layers
+    MAX_ROWS = 3000
 
     for ci in tqdm(active, desc="MLP probes"):
-        y = Y[:, ci]
-        if y.sum() == 0 or y.sum() == len(y):
-            continue
-
+        # Build sequential features on the FULL array to preserve per-file context
         prev, next_, mean, max_, std = build_sequential_features(scores_raw[:, ci])
-        X = np.hstack([
+        X_full = np.hstack([
             Z,
             scores_raw[:, ci:ci+1],
             prev[:, None], next_[:, None],
             mean[:, None], max_[:, None], std[:, None],
         ])
+
+        # Filter to labeled rows for actual training
+        X = X_full[train_idx]
+        y = Y_train[:, ci]
+
+        if y.sum() == 0 or y.sum() == len(y):
+            continue
 
         n_pos = int(y.sum()); n_neg = len(y) - n_pos
         pos_idx = np.where(y == 1)[0]
@@ -761,15 +873,15 @@ def train_mlp_probes(emb, scores_raw, Y, min_pos=5, pca_dim=64, alpha_blend=0.4)
         y_bal = np.concatenate([y, np.ones(n_pos * repeat, dtype=y.dtype)])
 
         clf = MLPClassifier(
-            hidden_layer_sizes=(128, 64),   # CHANGE 1: was (32,)
+            hidden_layer_sizes=(128, 64),
             activation="relu",
-            max_iter=300,                   # CHANGE 1: was 100
+            max_iter=300,
             early_stopping=True,
             validation_fraction=0.15,
-            n_iter_no_change=15,            # CHANGE 1: was 10
+            n_iter_no_change=15,
             random_state=42,
-            learning_rate_init=5e-4,        # CHANGE 1: was 1e-3 (lower lr for deeper net)
-            alpha=0.005,                    # CHANGE 1: was 0.01
+            learning_rate_init=5e-4,
+            alpha=0.005,
         )
         clf.fit(X_bal, y_bal)
         probe_models[ci] = clf
@@ -794,7 +906,7 @@ def apply_mlp_probes(emb_test, scores_test, probe_models, scaler, pca, alpha_ble
         result[:, ci] = (1 - alpha_blend) * scores_test[:, ci] + alpha_blend * logit
     return result
 
-print("✅ CHANGE 1: Upgraded MLP probe (pca_dim=64, hidden=(128,64), max_iter=300, min_pos=5)")
+print("✅ MLP probe: pca_dim=128, hidden=(128,64), label_mask support, max_iter=300, min_pos=5")
 # ── Cell 7f-2: Vectorized MLP probe inference ──────────────────────────
 import torch
 import torch.nn as nn
@@ -1727,7 +1839,7 @@ def run_pipeline_oof(emb_full, sc_full, Y_full, meta_full, n_splits=5):
             sc_tr_f,
             Y_tr_f,
             min_pos=5,
-            pca_dim=64,
+            pca_dim=128,
             alpha_blend=0.4,
         )
 
@@ -1787,7 +1899,9 @@ def sigmoid(x):
 t0 = time.time()
 proto_model, site2i_tr = train_light_proto_ssm(
     emb_tr, sc_tr, Y_FULL_aligned, meta_tr,
-    n_epochs=40, patience=8, lr=1e-3, verbose=False)
+    n_epochs=CFG["proto_ssm_train"]["n_epochs"],
+    patience=CFG["proto_ssm_train"]["patience"],
+    lr=1e-3, verbose=False)
 print(f"ProtoSSM training: {time.time()-t0:.1f}s")
 
 # ── Step B: Run ProtoSSM on TEST ───────────────────────────────────────
@@ -1806,15 +1920,14 @@ test_hour_ids = np.array([
     int(meta_te.loc[meta_te["filename"]==fn,"hour_utc"].iloc[0]) % 24
     for fn in test_fnames], dtype=np.int64)
 
-proto_model.eval()
-with torch.no_grad():
-    proto_out = proto_model(
-        torch.tensor(emb_te_f, dtype=torch.float32),
-        torch.tensor(sc_te_f,  dtype=torch.float32),
-        site_ids=torch.tensor(test_site_ids, dtype=torch.long),
-        hours   =torch.tensor(test_hour_ids, dtype=torch.long),
-    ).numpy()
+proto_out = run_tta_proto(
+    proto_model, emb_te_f, sc_te_f,
+    site_t=torch.tensor(test_site_ids, dtype=torch.long),
+    hour_t=torch.tensor(test_hour_ids, dtype=torch.long),
+    shifts=[0, 1, -1, 2, -2],
+)
 proto_scores_flat = proto_out.reshape(-1, N_CLASSES).astype(np.float32)
+print("TTA applied to test (5 circular shifts)")
 
 # ── Step C: Prior tables ───────────────────────────────────────────────
 prior_tables   = build_prior_tables(sc, Y_SC)
@@ -1826,10 +1939,11 @@ sc_te_adjusted = apply_prior(
     lambda_prior=0.4,
 )
 
-# ── Step D: MLP probes ─────────────────────────────────────────────────
+# ── Step D: MLP probes (trained on full + partial files with label mask) ──
 probe_models, emb_scaler, emb_pca, alpha_blend = train_mlp_probes(
-    emb=emb_tr, scores_raw=sc_tr, Y=Y_FULL_aligned,
-    min_pos=5, pca_dim=64, alpha_blend=0.4,
+    emb=emb_tr_ext, scores_raw=sc_tr_ext, Y=Y_tr_ext,
+    label_mask=mask_tr_ext,
+    min_pos=5, pca_dim=128, alpha_blend=0.4,
 )
 sc_te_adjusted = apply_mlp_probes_vectorized(
     emb_te, sc_te_adjusted,
