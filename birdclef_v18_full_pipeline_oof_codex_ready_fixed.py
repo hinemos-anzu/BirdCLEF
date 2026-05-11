@@ -83,11 +83,11 @@ CFG = {
 
     # V18 proto_ssm
     "proto_ssm_train": {
-        "n_epochs":        80  if MODE == "train" else 60,
+        "n_epochs":        80  if MODE == "train" else 40,
         "lr":              8e-4,
         "weight_decay":    1e-3,
         "val_ratio":       0.15,
-        "patience":        20  if MODE == "train" else 12,
+        "patience":        20  if MODE == "train" else 8,
         "pos_weight_cap":  25.0,
         "distill_weight":  0.15,
         "proto_margin":    0.15,
@@ -1826,10 +1826,7 @@ def sigmoid(x):
 t0 = time.time()
 proto_model, site2i_tr = train_light_proto_ssm(
     emb_tr, sc_tr, Y_FULL_aligned, meta_tr,
-    n_epochs=CFG["proto_ssm_train"]["n_epochs"],
-    patience=CFG["proto_ssm_train"]["patience"],
-    lr=CFG["proto_ssm_train"]["lr"],
-    verbose=False)
+    n_epochs=40, patience=8, lr=1e-3, verbose=False)
 print(f"ProtoSSM training: {time.time()-t0:.1f}s")
 
 # ── Step B: Run ProtoSSM on TEST ───────────────────────────────────────
