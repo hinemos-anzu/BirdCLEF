@@ -1839,7 +1839,7 @@ def sigmoid(x):
 t0 = time.time()
 proto_model, site2i_tr = train_light_proto_ssm(
     emb_tr, sc_tr, Y_FULL_aligned, meta_tr,
-    n_epochs=80, patience=20, lr=1e-3, verbose=False)  # TEST-2: 60→80 epochs (CFG design value)
+    n_epochs=60, patience=12, lr=1e-3, verbose=False)  # TEST-1 adopted (TEST-2 n_epochs=80 → LB 0.945, rejected)
 print(f"ProtoSSM training: {time.time()-t0:.1f}s")
 
 # ── Step B: Run ProtoSSM on TEST ───────────────────────────────────────
