@@ -1875,7 +1875,7 @@ sc_te_adjusted = apply_prior(
     sites=meta_te["site"].to_numpy(),
     hours=meta_te["hour_utc"].to_numpy(),
     tables=prior_tables,
-    lambda_prior=0.4,
+    lambda_prior=0.35,  # TEST-4: 0.4→0.35 (weaken prior, reduce suppression of rare species)
 )
 
 # ── Step D: MLP probes ─────────────────────────────────────────────────
@@ -1889,7 +1889,7 @@ sc_te_adjusted = apply_mlp_probes_vectorized(
 )
 
 # ── Step E: First-pass ensemble (ProtoSSM + MLP) ───────────────────────
-ENSEMBLE_W      = 0.6  # TEST-3: 0.5→0.6 (ProtoSSM weight up; MLP probes cover only ~25% of species)
+ENSEMBLE_W      = 0.5  # reverted (TEST-3 ENSEMBLE_W=0.6 → LB 0.944, rejected)
 first_pass_flat = (ENSEMBLE_W * proto_scores_flat
                    + (1.0 - ENSEMBLE_W) * sc_te_adjusted)
 
@@ -1927,7 +1927,7 @@ sc_tr_prior   = apply_prior(
     sites=meta_tr["site"].to_numpy(),
     hours=meta_tr["hour_utc"].to_numpy(),
     tables=prior_tables,
-    lambda_prior=0.4,
+    lambda_prior=0.35,  # TEST-4: 0.4→0.35 (weaken prior, reduce suppression of rare species)
 )
 sc_tr_mlp = apply_mlp_probes_vectorized(
     emb_tr, sc_tr_prior,
