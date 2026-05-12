@@ -1718,7 +1718,7 @@ def run_pipeline_oof(emb_full, sc_full, Y_full, meta_full, n_splits=5):
             meta_tr_f,
             n_epochs=60,
             patience=12,
-            lr=1e-3,
+            lr=8e-4,  # TEST-5: 1e-3→8e-4 (CFG design value; OOF-visible)
             verbose=False,
         )
 
@@ -1839,7 +1839,7 @@ def sigmoid(x):
 t0 = time.time()
 proto_model, site2i_tr = train_light_proto_ssm(
     emb_tr, sc_tr, Y_FULL_aligned, meta_tr,
-    n_epochs=60, patience=12, lr=1e-3, verbose=False)  # TEST-1 adopted (TEST-2 n_epochs=80 → LB 0.945, rejected)
+    n_epochs=60, patience=12, lr=8e-4, verbose=False)  # TEST-5: lr 1e-3→8e-4 (CFG value; OOF-visible)
 print(f"ProtoSSM training: {time.time()-t0:.1f}s")
 
 # ── Step B: Run ProtoSSM on TEST ───────────────────────────────────────
@@ -1875,7 +1875,7 @@ sc_te_adjusted = apply_prior(
     sites=meta_te["site"].to_numpy(),
     hours=meta_te["hour_utc"].to_numpy(),
     tables=prior_tables,
-    lambda_prior=0.35,  # TEST-4: 0.4→0.35 (weaken prior, reduce suppression of rare species)
+    lambda_prior=0.4,
 )
 
 # ── Step D: MLP probes ─────────────────────────────────────────────────
@@ -1927,7 +1927,7 @@ sc_tr_prior   = apply_prior(
     sites=meta_tr["site"].to_numpy(),
     hours=meta_tr["hour_utc"].to_numpy(),
     tables=prior_tables,
-    lambda_prior=0.35,  # TEST-4: 0.4→0.35 (weaken prior, reduce suppression of rare species)
+    lambda_prior=0.4,
 )
 sc_tr_mlp = apply_mlp_probes_vectorized(
     emb_tr, sc_tr_prior,
@@ -1955,7 +1955,7 @@ res_model, correction_weight = train_residual_ssm(
     hour_ids=tr_hour_ids,
     n_epochs=30,
     patience=8,
-    lr=1e-3,
+    lr=8e-4,  # TEST-5: 1e-3→8e-4 (CFG value; aligned with ProtoSSM lr)
     correction_weight=0.30,  # 0.35 (CFG) caused LB regression; 0.30 is LB-validated
     verbose=False,
 )
