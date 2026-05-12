@@ -1956,7 +1956,7 @@ res_model, correction_weight = train_residual_ssm(
     n_epochs=30,
     patience=8,
     lr=1e-3,  # reverted (TEST-5 lr=8e-4 → LB 0.945, rejected)
-    correction_weight=0.30,  # 0.35 (CFG) caused LB regression; 0.30 is LB-validated
+    correction_weight=0.25,  # TEST-7: 0.30→0.25 (reduce overcorrection; 0.35 regressed, 0.30 is prior validated floor)
     verbose=False,
 )
 print(f"ResidualSSM training: {time.time()-t0:.1f}s")
@@ -2109,7 +2109,7 @@ else:
     print(f"SED branch done — shape {sed_sub.shape}")
     SED_AVAILABLE = True
 
-# ── Cell 12: Rank Blend (55% ProtoSSM / 45% SED) ─────────────────────  TEST-6
+# ── Cell 12: Rank Blend (60% ProtoSSM / 40% SED) ─────────────────────
 EPS = 1e-5
 
 df_proto = pd.read_csv("submission_protossm.csv")
@@ -2125,8 +2125,8 @@ if SED_AVAILABLE:
     rank_proto = pd.DataFrame(p_proto).rank(axis=0, pct=True).to_numpy(np.float32)
     rank_sed   = pd.DataFrame(p_sed).rank(axis=0, pct=True).to_numpy(np.float32)
 
-    # 55% ProtoSSM + 45% SED rank blend  TEST-6: 60/40→55/45
-    pred = rank_proto * 0.55 + rank_sed * 0.45
+    # 60% ProtoSSM + 40% SED rank blend  (TEST-6 55/45 → LB 0.945, reverted)
+    pred = rank_proto * 0.60 + rank_sed * 0.40
 
     row_ids  = df_proto["row_id"].astype(str).to_numpy()
     file_ids = np.array(["_".join(r.split("_")[:-1]) for r in row_ids])
