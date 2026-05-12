@@ -1718,7 +1718,7 @@ def run_pipeline_oof(emb_full, sc_full, Y_full, meta_full, n_splits=5):
             meta_tr_f,
             n_epochs=60,
             patience=12,
-            lr=8e-4,  # TEST-5: 1e-3→8e-4 (CFG design value; OOF-visible)
+            lr=1e-3,  # reverted (TEST-5 lr=8e-4 → LB 0.945, rejected)
             verbose=False,
         )
 
@@ -1839,7 +1839,7 @@ def sigmoid(x):
 t0 = time.time()
 proto_model, site2i_tr = train_light_proto_ssm(
     emb_tr, sc_tr, Y_FULL_aligned, meta_tr,
-    n_epochs=60, patience=12, lr=8e-4, verbose=False)  # TEST-5: lr 1e-3→8e-4 (CFG value; OOF-visible)
+    n_epochs=60, patience=12, lr=1e-3, verbose=False)  # TEST-1 adopted; TEST-5 lr=8e-4 → LB 0.945 rejected
 print(f"ProtoSSM training: {time.time()-t0:.1f}s")
 
 # ── Step B: Run ProtoSSM on TEST ───────────────────────────────────────
@@ -1955,7 +1955,7 @@ res_model, correction_weight = train_residual_ssm(
     hour_ids=tr_hour_ids,
     n_epochs=30,
     patience=8,
-    lr=8e-4,  # TEST-5: 1e-3→8e-4 (CFG value; aligned with ProtoSSM lr)
+    lr=1e-3,  # reverted (TEST-5 lr=8e-4 → LB 0.945, rejected)
     correction_weight=0.30,  # 0.35 (CFG) caused LB regression; 0.30 is LB-validated
     verbose=False,
 )
@@ -2109,7 +2109,7 @@ else:
     print(f"SED branch done — shape {sed_sub.shape}")
     SED_AVAILABLE = True
 
-# ── Cell 12: Rank Blend (60% ProtoSSM / 40% SED) ─────────────────────
+# ── Cell 12: Rank Blend (55% ProtoSSM / 45% SED) ─────────────────────  TEST-6
 EPS = 1e-5
 
 df_proto = pd.read_csv("submission_protossm.csv")
@@ -2125,8 +2125,8 @@ if SED_AVAILABLE:
     rank_proto = pd.DataFrame(p_proto).rank(axis=0, pct=True).to_numpy(np.float32)
     rank_sed   = pd.DataFrame(p_sed).rank(axis=0, pct=True).to_numpy(np.float32)
 
-    # 60% ProtoSSM + 40% SED rank blend
-    pred = rank_proto * 0.60 + rank_sed * 0.40
+    # 55% ProtoSSM + 45% SED rank blend  TEST-6: 60/40→55/45
+    pred = rank_proto * 0.55 + rank_sed * 0.45
 
     row_ids  = df_proto["row_id"].astype(str).to_numpy()
     file_ids = np.array(["_".join(r.split("_")[:-1]) for r in row_ids])
