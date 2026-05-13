@@ -38,10 +38,10 @@ MODE = "train"   # ← change to "train" for local CV
 assert MODE in {"train", "submit"}
 print("MODE =", MODE)
 # ── Cell 2: Imports & config ───────────────────────────────────────────
-import os, re, gc, time, warnings
+import os, re, gc, time, warnings, random
 os.environ["TF_CPP_MIN_LOG_LEVEL"] = "3"
 warnings.filterwarnings("ignore")
- 
+
 import numpy as np
 import pandas as pd
 import soundfile as sf
@@ -49,11 +49,17 @@ import tensorflow as tf
 from sklearn.metrics import roc_auc_score
 from sklearn.model_selection import GroupKFold
 from tqdm.auto import tqdm
- 
+
 tf.experimental.numpy.experimental_enable_numpy_behavior()
 try: tf.config.set_visible_devices([], "GPU")
 except: pass
- 
+
+def seed_everything(seed=42):
+    random.seed(seed)
+    os.environ['PYTHONHASHSEED'] = str(seed)
+    np.random.seed(seed)
+    # torch seeded after torch import below
+
 _WALL_START = time.time()
  
 BASE      = Path("/kaggle/input/competitions/birdclef-2026")
@@ -184,8 +190,9 @@ print(f"Full-file windows: {len(full_rows)} | Active classes: {int((Y_FULL.sum(0
 birdclassifier = tf.saved_model.load(str(MODEL_DIR))
 infer_fn       = birdclassifier.signatures["serving_default"]
 
-# ONNX session (150x faster)
-ONNX_PERCH_PATH = Path("/kaggle/input/datasets/rishikeshjani/perch-onnx-for-birdclef-2026/perch_v2.onnx")
+# ONNX session (150x faster) — prefer no_dft variant if available
+ONNX_PERCH_PATH = next(INPUT_ROOT.glob("**/perch_v2_no_dft*.onnx"),
+                   next(INPUT_ROOT.glob("**/perch_v2*.onnx"), Path("")))
 USE_ONNX = _ONNX_AVAILABLE and ONNX_PERCH_PATH.exists()
 
 if USE_ONNX:
@@ -355,11 +362,17 @@ print("✅ Perch inference engine (ONNX + multithreaded I/O) defined")
 print(f"USE_ONNX = {USE_ONNX}  "
       f"(cache will be built with {'ONNX' if USE_ONNX else 'TF SavedModel'})")
 
-# ── Candidate external cache locations (add your own paths here) ──────
+# ── Candidate external cache locations ────────────────────────────────
+# Priority order: first match wins.
+# To reuse a previously built cache across sessions:
+#   1. After a run, go to Kaggle notebook → Output → "Save as Dataset"
+#   2. Mount that dataset as input in the next run
+#   3. Add its path here (e.g. "/kaggle/input/datasets/<user>/perch-cache-bc2026")
 EXTERNAL_CACHE_DIRS = [
     Path("/kaggle/input/notebooks/vyankteshdwivedi/notebook1b25083f0d"),
     Path("/kaggle/input/datasets/jaejohn/perch-meta"),
-    # add more here if needed
+    # ── Add your own saved cache dataset path below ──────────────────
+    # Path("/kaggle/input/datasets/<your-username>/birdclef2026-perch-cache"),
 ]
 
 CACHE_META_LOCAL = WORK_DIR / "perch_meta.parquet"
@@ -370,6 +383,7 @@ def _find_external_cache():
         meta = d / "perch_meta.parquet"
         npz  = d / "perch_arrays.npz"
         if meta.exists() and npz.exists():
+            print(f"  Found external cache: {d}")
             return meta, npz
     return None, None
 
@@ -417,7 +431,15 @@ def _build_cache():
         embs=emb_built.astype(np.float32),
         primary_labels=np.array(PRIMARY_LABELS),
     )
-    print(f"  Cache saved to {WORK_DIR}")
+    elapsed = time.time() - t0
+    print(f"  Cache saved to {WORK_DIR}  ({elapsed:.1f}s)")
+    print(
+        f"\n  *** To skip this {elapsed:.0f}s build in future runs: ***\n"
+        f"  1. Kaggle notebook → Output → [Save Version] → tick 'Save output'\n"
+        f"  2. Go to the output dataset → 'New Dataset from output'\n"
+        f"  3. Note the dataset slug, add it to EXTERNAL_CACHE_DIRS at the top\n"
+        f"  Files to include: {CACHE_META_LOCAL.name}, {CACHE_NPZ_LOCAL.name}\n"
+    )
     return CACHE_META_LOCAL, CACHE_NPZ_LOCAL
 
 # ── Priority: external > local working > build ────────────────────────
@@ -584,57 +606,81 @@ def build_prior_tables(sc_df, Y_labels):
         hour_n[i] = mask.sum()
         hour_p[i] = Y_labels[mask].mean(axis=0)
     
+    # ── Joint site × hour frequencies ─────────────────────────────────────
+    sh_keys = sorted({
+        (str(s), int(h))
+        for s, h in zip(sc_df["site"].dropna(), sc_df["hour_utc"].dropna())
+        if not pd.isna(s) and not pd.isna(h)
+    })
+    sh_to_i = {k: i for i, k in enumerate(sh_keys)}
+    sh_p    = np.zeros((len(sh_keys), Y_labels.shape[1]), dtype=np.float32)
+    sh_n    = np.zeros(len(sh_keys), dtype=np.float32)
+
+    for (s, h) in sh_keys:
+        i    = sh_to_i[(s, h)]
+        mask = (sc_df["site"].astype(str).values == s) & \
+               (sc_df["hour_utc"].astype(int).values == h)
+        sh_n[i] = mask.sum()
+        sh_p[i] = Y_labels[mask].mean(axis=0)
+
     return {
         "global_p": global_p,
         "site_to_i": site_to_i, "site_p": site_p, "site_n": site_n,
         "hour_to_i": hour_to_i, "hour_p": hour_p, "hour_n": hour_n,
+        "sh_to_i":   sh_to_i,   "sh_p":   sh_p,   "sh_n":   sh_n,
     }
 
 
 def apply_prior(scores, sites, hours, tables, lambda_prior=0.4):
     """
     Add a scaled prior logit to the raw Perch scores.
-    
-    lambda_prior=0: no effect (your baseline)
-    lambda_prior=0.4: moderate influence from location/time
-    
-    The prior is converted to a logit (log-odds) before adding.
-    This is mathematically correct — you add logits, not probabilities.
+    Uses a 3-tier hierarchy: global → hour → site → joint site×hour.
+    Tighter Bayesian shrinkage (denominator=4) for sparse joint buckets.
     """
     eps = 1e-4
     n   = len(scores)
     out = scores.copy()
-    
+
     # Start from global average
     p = np.tile(tables["global_p"], (n, 1))  # (n, 234)
-    
-    # Override with hour-level estimate (if enough data)
+
+    # Override with hour-level estimate
     for i, h in enumerate(hours):
         h = int(h)
         if h in tables["hour_to_i"]:
             j   = tables["hour_to_i"][h]
             nh  = tables["hour_n"][j]
-            w   = nh / (nh + 8.0)   # shrink toward global if little data
+            w   = nh / (nh + 8.0)
             p[i] = w * tables["hour_p"][j] + (1 - w) * tables["global_p"]
-    
-    # Override with site-level estimate (if enough data)
+
+    # Override with site-level estimate
     for i, s in enumerate(sites):
         s = str(s)
         if s in tables["site_to_i"]:
             j   = tables["site_to_i"][s]
             ns  = tables["site_n"][j]
-            w   = ns / (ns + 8.0)   # same shrinkage logic
+            w   = ns / (ns + 8.0)
             p[i] = w * tables["site_p"][j] + (1 - w) * p[i]
-    
+
+    # Override with joint site×hour estimate (tighter shrinkage: +4 not +8)
+    if "sh_to_i" in tables:
+        for i, (s, h) in enumerate(zip(sites, hours)):
+            key = (str(s), int(h))
+            if key in tables["sh_to_i"]:
+                j   = tables["sh_to_i"][key]
+                nsh = tables["sh_n"][j]
+                w   = nsh / (nsh + 4.0)
+                p[i] = w * tables["sh_p"][j] + (1 - w) * p[i]
+
     # Convert prior probability to logit and add
-    p      = np.clip(p, eps, 1 - eps)
+    p           = np.clip(p, eps, 1 - eps)
     logit_prior = np.log(p) - np.log1p(-p)
-    out   += lambda_prior * logit_prior
-    
+    out        += lambda_prior * logit_prior
+
     return out.astype(np.float32)
 
 
-print("✅ Prior table functions defined")
+print("✅ Prior table functions defined (with joint site×hour prior)")
 # ── Cell 7d: File-level confidence scaling ─────────────────────────────
 def file_confidence_scale(probs, n_windows=12, top_k=2, power=0.4):
     """
@@ -717,7 +763,7 @@ def train_mlp_probes(emb, scores_raw, Y, min_pos=5, pca_dim=64, alpha_blend=0.4)
     - pca_dim: 32 → 64  (more embedding information)
     - hidden:  (32,) → (128, 64)  (more capacity)
     - max_iter: 100 → 300  (longer training)
-    - min_pos: 8 → 5  (catches more rare species)
+    - min_pos: 8 → 5  (catches more rare species; 3 caused LB regression)
     """
     # Step 1: Compress embeddings
     scaler = StandardScaler()
@@ -798,6 +844,12 @@ print("✅ CHANGE 1: Upgraded MLP probe (pca_dim=64, hidden=(128,64), max_iter=3
 # ── Cell 7f-2: Vectorized MLP probe inference ──────────────────────────
 import torch
 import torch.nn as nn
+
+torch.manual_seed(42)
+torch.backends.cudnn.deterministic = True
+torch.backends.cudnn.benchmark = False
+seed_everything(42)
+print("✅ seed_everything(42) applied")
 
 class VectorizedMLPProbes(nn.Module):
     """Stacks all per-class MLP weights into a single batched PyTorch model.
@@ -1664,9 +1716,9 @@ def run_pipeline_oof(emb_full, sc_full, Y_full, meta_full, n_splits=5):
             sc_tr_f,
             Y_tr_f,
             meta_tr_f,
-            n_epochs=40,
-            patience=8,
-            lr=1e-3,
+            n_epochs=60,
+            patience=12,
+            lr=1e-3,  # reverted (TEST-5 lr=8e-4 → LB 0.945, rejected)
             verbose=False,
         )
 
@@ -1787,7 +1839,7 @@ def sigmoid(x):
 t0 = time.time()
 proto_model, site2i_tr = train_light_proto_ssm(
     emb_tr, sc_tr, Y_FULL_aligned, meta_tr,
-    n_epochs=40, patience=8, lr=1e-3, verbose=False)
+    n_epochs=60, patience=12, lr=1e-3, verbose=False)  # TEST-1 adopted; TEST-5 lr=8e-4 → LB 0.945 rejected
 print(f"ProtoSSM training: {time.time()-t0:.1f}s")
 
 # ── Step B: Run ProtoSSM on TEST ───────────────────────────────────────
@@ -1837,7 +1889,7 @@ sc_te_adjusted = apply_mlp_probes_vectorized(
 )
 
 # ── Step E: First-pass ensemble (ProtoSSM + MLP) ───────────────────────
-ENSEMBLE_W      = 0.5
+ENSEMBLE_W      = 0.5  # reverted (TEST-3 ENSEMBLE_W=0.6 → LB 0.944, rejected)
 first_pass_flat = (ENSEMBLE_W * proto_scores_flat
                    + (1.0 - ENSEMBLE_W) * sc_te_adjusted)
 
@@ -1903,8 +1955,8 @@ res_model, correction_weight = train_residual_ssm(
     hour_ids=tr_hour_ids,
     n_epochs=30,
     patience=8,
-    lr=1e-3,
-    correction_weight=0.30,
+    lr=1e-3,  # reverted (TEST-5 lr=8e-4 → LB 0.945, rejected)
+    correction_weight=0.30,  # reverted (TEST-7 correction_weight=0.25 → rejected)
     verbose=False,
 )
 print(f"ResidualSSM training: {time.time()-t0:.1f}s")
@@ -1927,6 +1979,10 @@ final_scores    = (first_pass_flat
 print(f"Correction applied — "
       f"mean_abs={np.abs(correction_flat).mean():.4f}  "
       f"score range [{final_scores.min():.3f}, {final_scores.max():.3f}]")
+
+del emb_tr_f, sc_tr_f, proto_model, res_model
+gc.collect()
+print("Memory freed. Ready for SED cell.")
 
 # ── Step G: Temperature scaling ────────────────────────────────────────
 final_scores = final_scores / temperatures[None, :]
@@ -1951,10 +2007,200 @@ sub.insert(0, "row_id", meta_te["row_id"].values)
 assert list(sub.columns) == ["row_id"] + PRIMARY_LABELS
 assert len(sub) == len(test_paths) * N_WINDOWS
 assert not sub.isna().any().any()
-sub.to_csv("submission.csv", index=False)
+sub.to_csv("submission_protossm.csv", index=False)
+print(f"\nsubmission_protossm.csv saved — shape {sub.shape}")
 
-print(f"\nsubmission.csv saved — shape {sub.shape}")
-print(f"Total wall time: {(time.time() - _WALL_START)/60:.1f} min")
+# ── Cell 11: Distilled SED Branch ─────────────────────────────────────
+# Tucker Arrants' public distilled SED ONNX folds.
+# Dataset must be attached as Kaggle input; internet is disabled.
+# Skips gracefully if the dataset is not attached.
 
- 
+import librosa
+from scipy.ndimage import gaussian_filter1d
+
+N_MELS_SED = 256
+N_FFT_SED  = 2048
+HOP_SED    = 512
+FMIN_SED   = 20
+FMAX_SED   = 16000
+TOP_DB_SED = 80
+
+
+def _find_sed_dir():
+    hits = sorted(Path("/kaggle/input").rglob("sed_fold0.onnx"))
+    if not hits:
+        return None
+    return hits[0].parent
+
+
+def _make_sed_session(path):
+    so = ort.SessionOptions()
+    so.intra_op_num_threads = 4
+    so.inter_op_num_threads = 1
+    so.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
+    return ort.InferenceSession(str(path), sess_options=so,
+                                providers=["CPUExecutionProvider"])
+
+
+def _audio_to_mel(chunks):
+    mels = []
+    for x in chunks:
+        s = librosa.feature.melspectrogram(
+            y=x, sr=SR, n_fft=N_FFT_SED, hop_length=HOP_SED,
+            n_mels=N_MELS_SED, fmin=FMIN_SED, fmax=FMAX_SED, power=2.0)
+        s = librosa.power_to_db(s, top_db=TOP_DB_SED)
+        s = (s - s.mean()) / (s.std() + 1e-6)
+        mels.append(s)
+    return np.stack(mels)[:, None].astype(np.float32)
+
+
+def _file_to_sed_chunks(path):
+    y, sr0 = sf.read(str(path), dtype="float32", always_2d=False)
+    if y.ndim == 2:
+        y = y.mean(axis=1)
+    if sr0 != SR:
+        y = librosa.resample(y, orig_sr=sr0, target_sr=SR)
+    n = FILE_SAMPLES
+    y = np.pad(y, (0, max(0, n - len(y))))[:n]
+    chunks = y.reshape(N_WINDOWS, WINDOW_SAMPLES)
+    ends   = np.arange(1, N_WINDOWS + 1) * WINDOW_SEC
+    return chunks, ends
+
+
+def _sigmoid_sed(x):
+    return (1.0 / (1.0 + np.exp(-np.clip(x, -50, 50)))).astype(np.float32)
+
+
+sed_dir = _find_sed_dir()
+
+if sed_dir is None or not _ONNX_AVAILABLE:
+    print("SED dataset not found or ONNX unavailable — skipping SED branch.")
+    SED_AVAILABLE = False
+else:
+    sed_fold_paths = sorted(
+        sed_dir.glob("sed_fold*.onnx"),
+        key=lambda p: int(re.search(r"sed_fold(\d+)", p.name).group(1))
+    )
+    sed_sessions = [_make_sed_session(p) for p in sed_fold_paths]
+    print(f"SED folds loaded: {len(sed_sessions)}")
+
+    sed_rows, sed_preds = [], []
+    for path in tqdm(test_paths, desc="SED"):
+        chunks, ends = _file_to_sed_chunks(path)
+        mel = _audio_to_mel(chunks)
+        p_sum = np.zeros((len(chunks), N_CLASSES), dtype=np.float32)
+        for sess in sed_sessions:
+            outs = sess.run(None, {sess.get_inputs()[0].name: mel})
+            clip_logits = outs[0]
+            frame_max   = outs[1].max(axis=1)
+            p_sum += 0.5 * _sigmoid_sed(clip_logits) + 0.5 * _sigmoid_sed(frame_max)
+        p_mean = p_sum / max(len(sed_sessions), 1)
+        if len(p_mean) > 1:
+            p_mean = gaussian_filter1d(
+                p_mean, sigma=0.65, axis=0, mode="nearest").astype(np.float32)
+        stem = Path(path).stem
+        sed_rows.extend([f"{stem}_{int(t)}" for t in ends])
+        sed_preds.append(p_mean)
+
+    sed_preds_arr = np.concatenate(sed_preds, axis=0)
+    sed_sub = pd.DataFrame(np.clip(sed_preds_arr, 0.0, 1.0), columns=PRIMARY_LABELS)
+    sed_sub.insert(0, "row_id", sed_rows)
+    sed_sub.to_csv("submission_sed.csv", index=False)
+    print(f"SED branch done — shape {sed_sub.shape}")
+    SED_AVAILABLE = True
+
+# ── Cell 12: Rank Blend (60% ProtoSSM / 40% SED) ─────────────────────
+EPS = 1e-5
+
+df_proto = pd.read_csv("submission_protossm.csv")
+cols = [c for c in df_proto.columns if c != "row_id"]
+
+if SED_AVAILABLE:
+    df_sed = pd.read_csv("submission_sed.csv")
+    df_sed = df_sed.set_index("row_id").loc[df_proto["row_id"]].reset_index()
+
+    p_proto = np.clip(df_proto[cols].to_numpy(np.float32), EPS, 1.0 - EPS)
+    p_sed   = np.clip(df_sed[cols].to_numpy(np.float32),   EPS, 1.0 - EPS)
+
+    rank_proto = pd.DataFrame(p_proto).rank(axis=0, pct=True).to_numpy(np.float32)
+    rank_sed   = pd.DataFrame(p_sed).rank(axis=0, pct=True).to_numpy(np.float32)
+
+    # TEST-8 SED blend 0.61/0.39 → LB 0.945 rejected; reverted to 0.60/0.40
+    pred = rank_proto * 0.60 + rank_sed * 0.40
+
+    row_ids  = df_proto["row_id"].astype(str).to_numpy()
+    file_ids = np.array(["_".join(r.split("_")[:-1]) for r in row_ids])
+
+    # Noise suppression: ProtoSSM high + SED very low → down-weight
+    fake_only = (p_proto > 0.50) & (p_sed < 0.05)
+    pred = np.where(fake_only, 0.92 * pred + 0.08 * rank_proto, pred)
+
+    # t-distribution kernel for temporal continuity (±3 windows, ~35s)
+    offs         = np.arange(-3, 4, dtype=np.float32)
+    proto_kernel = (1.0 + (offs / 1.20) ** 2 / 2.0) ** (-1.5)
+    proto_kernel = (proto_kernel / proto_kernel.sum()).astype(np.float32)
+
+    pa_ctx = p_proto.copy()
+    for fid in pd.unique(file_ids):
+        m = file_ids == fid
+        x = p_proto[m]
+        if len(x) > 1:
+            xp = np.pad(x, ((3, 3), (0, 0)), mode="edge")
+            pa_ctx[m] = sum(proto_kernel[i] * xp[i:i + len(x)] for i in range(7))
+
+    xctx       = pd.DataFrame(pa_ctx).rank(axis=0, pct=True).to_numpy(np.float32)
+    proto_cont = (xctx > 0.90) & (rank_proto > 0.75) & (p_sed < 0.12) & (~fake_only)  # TEST-9: 0.88→0.90
+    pred = np.where(proto_cont,
+                    0.85 * pred + 0.15 * np.maximum(rank_proto, xctx),
+                    pred)
+
+    # SED spike preservation: isolated high-SED events
+    sed_only = (rank_sed > 0.95) & (rank_proto < 0.80) & (~fake_only) & (~proto_cont)
+    pred = np.where(sed_only, 0.88 * pred + 0.12 * rank_sed, pred)
+
+    # Sonotype mirroring: unify acoustically identical species groups
+    MIRROR_PAIRS = (
+        ("47158son15", "47158son16"),
+        ("47158son09", "47158son12"),
+        ("47158son02", "47158son14"),
+        ("47158son13", "47158son21", "47158son22", "47158son23"),
+    )
+    col_to_idx = {l: i for i, l in enumerate(cols)}
+    mirror_count = 0
+    sub_blend = df_proto.copy()
+    sub_blend[cols] = pred.astype(np.float32)
+    for group in MIRROR_PAIRS:
+        valid_idx = [col_to_idx[s] for s in group if s in col_to_idx]
+        if len(valid_idx) >= 2:
+            group_max = sub_blend[cols].iloc[:, valid_idx].max(axis=1).to_numpy(np.float32)
+            for idx in valid_idx:
+                sub_blend.iloc[:, idx + 1] = group_max
+            mirror_count += len(valid_idx)
+    print(f"Sonotype mirroring applied to {mirror_count} columns.")
+
+    # Adaptive suppression of rare taxa
+    try:
+        tax_df = pd.read_csv(BASE / "taxonomy.csv").set_index("primary_label")
+        rare_classes = {"Amphibia", "Mammalia", "Reptilia"}
+        rare_count = 0
+        for ci, species in enumerate(cols):
+            if species in tax_df.index and \
+               tax_df.loc[species, "class_name"] in rare_classes:
+                vals = sub_blend.iloc[:, ci + 1].to_numpy(np.float32)
+                thr  = vals.mean() + 0.05
+                sub_blend.iloc[:, ci + 1] = np.where(vals < thr, vals * 0.9, vals)
+                rare_count += 1
+        print(f"Adaptive thresholding applied to {rare_count} rare species.")
+    except Exception as e:
+        print(f"Adaptive thresholding skipped: {e}")
+
+    sub_blend.to_csv("submission.csv", index=False)
+    print(f"Blended submission saved — shape {sub_blend.shape}")
+else:
+    # SED not available: promote ProtoSSM output directly
+    df_proto.to_csv("submission.csv", index=False)
+    print("SED unavailable — using ProtoSSM output as final submission.")
+
+print(f"\nTotal wall time: {(time.time() - _WALL_START)/60:.1f} min")
+
  
