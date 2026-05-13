@@ -2125,8 +2125,8 @@ if SED_AVAILABLE:
     rank_proto = pd.DataFrame(p_proto).rank(axis=0, pct=True).to_numpy(np.float32)
     rank_sed   = pd.DataFrame(p_sed).rank(axis=0, pct=True).to_numpy(np.float32)
 
-    # TEST-8: ProtoSSM 0.61 / SED 0.39  (was 0.60/0.40; TEST-6 0.55/0.45 → LB 0.945 rejected)
-    pred = rank_proto * 0.61 + rank_sed * 0.39
+    # TEST-8 SED blend 0.61/0.39 → LB 0.945 rejected; reverted to 0.60/0.40
+    pred = rank_proto * 0.60 + rank_sed * 0.40
 
     row_ids  = df_proto["row_id"].astype(str).to_numpy()
     file_ids = np.array(["_".join(r.split("_")[:-1]) for r in row_ids])
@@ -2149,7 +2149,7 @@ if SED_AVAILABLE:
             pa_ctx[m] = sum(proto_kernel[i] * xp[i:i + len(x)] for i in range(7))
 
     xctx       = pd.DataFrame(pa_ctx).rank(axis=0, pct=True).to_numpy(np.float32)
-    proto_cont = (xctx > 0.88) & (rank_proto > 0.75) & (p_sed < 0.12) & (~fake_only)
+    proto_cont = (xctx > 0.90) & (rank_proto > 0.75) & (p_sed < 0.12) & (~fake_only)  # TEST-9: 0.88→0.90
     pred = np.where(proto_cont,
                     0.85 * pred + 0.15 * np.maximum(rank_proto, xctx),
                     pred)
