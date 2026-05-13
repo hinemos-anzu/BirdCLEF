@@ -1956,7 +1956,7 @@ res_model, correction_weight = train_residual_ssm(
     n_epochs=30,
     patience=8,
     lr=1e-3,  # reverted (TEST-5 lr=8e-4 → LB 0.945, rejected)
-    correction_weight=0.25,  # TEST-7: 0.30→0.25 (reduce overcorrection; 0.35 regressed, 0.30 is prior validated floor)
+    correction_weight=0.30,  # reverted (TEST-7 correction_weight=0.25 → rejected)
     verbose=False,
 )
 print(f"ResidualSSM training: {time.time()-t0:.1f}s")
@@ -2125,8 +2125,8 @@ if SED_AVAILABLE:
     rank_proto = pd.DataFrame(p_proto).rank(axis=0, pct=True).to_numpy(np.float32)
     rank_sed   = pd.DataFrame(p_sed).rank(axis=0, pct=True).to_numpy(np.float32)
 
-    # 60% ProtoSSM + 40% SED rank blend  (TEST-6 55/45 → LB 0.945, reverted)
-    pred = rank_proto * 0.60 + rank_sed * 0.40
+    # TEST-8: ProtoSSM 0.61 / SED 0.39  (was 0.60/0.40; TEST-6 0.55/0.45 → LB 0.945 rejected)
+    pred = rank_proto * 0.61 + rank_sed * 0.39
 
     row_ids  = df_proto["row_id"].astype(str).to_numpy()
     file_ids = np.array(["_".join(r.split("_")[:-1]) for r in row_ids])
