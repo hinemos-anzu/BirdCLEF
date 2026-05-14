@@ -1,10 +1,12 @@
-# BirdCLEF+ 2026 — v5: 0.947 Pipeline + BirdNET Gate3b-Only
+# BirdCLEF+ 2026 — v6: 0.947 Base + BirdNET Case 2 (no-signal species only)
 #
-# Change from v4:
-#   Base blend is always 60/40 (ProtoSSM/SED) regardless of BirdNET availability.
-#   BirdNET is used only as a conservative Gate 3b supplement (threshold 0.97, weight 0.05).
-#   This restores the 0.947 base while retaining BirdNET as a safety net for
-#   species that both ProtoSSM and SED miss with very high confidence.
+# Strategy:
+#   Base blend is always 60/40 (ProtoSSM/SED) for the 206 species where Perch
+#   has a direct logit or genus proxy — identical to the original 0.947.
+#
+#   For the 28 species where Perch has ZERO signal (unmapped AND no proxy),
+#   ProtoSSM lacks any Perch logit, so BirdNET adds genuine new information.
+#   Those 28 species use a 30/40/30 Proto/SED/BirdNET blend instead.
 #
 # Attribution: Vyanktesh Dwivedi (base), Imaad Mahmood (ProtoSSM 0.946),
 #              Tucker Arrants (SED), Stefan Kahl et al. (BirdNET),
@@ -1181,13 +1183,43 @@ p_sed   = np.clip(df_sed[cols].to_numpy(np.float32),   EPS, 1.0 - EPS)
 rank_proto = pd.DataFrame(p_proto).rank(axis=0, pct=True).to_numpy(np.float32)
 rank_sed   = pd.DataFrame(p_sed).rank(axis=0, pct=True).to_numpy(np.float32)
 
-# ── BirdNET loaded for future use but Gate 3b disabled to match 0.947 exactly ─
-rank_birdnet = None  # Gate 3b disabled: BirdNET scores not used in blend
-print("BirdNET blend disabled — Gate 3b inactive (matching original 0.947)")
+# ── Load BirdNET (Case 2: no-signal species only) ────────────────────────────
+# 28 species where Perch has zero signal (unmapped AND no genus proxy).
+# For these, ProtoSSM has no Perch logit to fuse, so BirdNET adds real value.
+# All other 206 species keep the original 60/40 blend exactly.
+try:
+    df_birdnet = pd.read_csv("submission_birdnet.csv")
+    df_birdnet = df_birdnet.set_index("row_id").loc[df_proto["row_id"]].reset_index()
+    p_birdnet  = np.clip(df_birdnet[cols].to_numpy(np.float32), EPS, 1.0 - EPS)
+    _bn_active = (p_birdnet > 0.01).any()
+    if _bn_active:
+        rank_birdnet = pd.DataFrame(p_birdnet).rank(axis=0, pct=True).to_numpy(np.float32)
+        print("BirdNET loaded — Case 2: no-signal species only")
+    else:
+        rank_birdnet = None
+        print("BirdNET scores all zero — Case 2 inactive")
+except Exception as _e:
+    rank_birdnet = None
+    print(f"BirdNET load failed ({_e}) — Case 2 inactive")
 
-# ── Base blend: always 60/40 (original 0.947 setting) ─────────────────────────
+# No-signal species: Perch has no direct logit AND no genus proxy
+# UNMAPPED_POS and proxy_map are defined in Cell 1
+_no_signal_idx = [int(i) for i in UNMAPPED_POS if i not in proxy_map]
+print(f"No-signal species (Perch blind spots): {len(_no_signal_idx)}")
+
+# ── Base blend: 60/40 for all species (original 0.947 setting) ────────────────
 print("Executing standard 2-way rank blend (60% Proto / 40% SED)...")
 pred = (rank_proto * 0.60) + (rank_sed * 0.40)
+
+# ── Case 2: BirdNET supplement for no-signal species only ─────────────────────
+# Replace 30% of Proto with BirdNET for the 28 Perch-blind species.
+# SED weight stays at 40%; Proto drops 60%→30%; BirdNET adds 30%.
+if rank_birdnet is not None and _no_signal_idx:
+    for ci in _no_signal_idx:
+        pred[:, ci] = (rank_proto[:, ci] * 0.30
+                       + rank_sed[:, ci]    * 0.40
+                       + rank_birdnet[:, ci] * 0.30)
+    print(f"Case 2 blend applied: {len(_no_signal_idx)} no-signal species → 30/40/30 Proto/SED/BirdNET")
 
 row_ids  = df_proto["row_id"].astype(str).to_numpy()
 file_ids = np.array(["_".join(r.split("_")[:-1]) for r in row_ids])
@@ -1219,8 +1251,7 @@ pred = np.where(proto_cont,
 sed_only = (rank_sed > 0.95) & (rank_proto < 0.80) & (~fake_only) & (~proto_cont)
 pred = np.where(sed_only, (1.0 - 0.12) * pred + 0.12 * rank_sed, pred)
 
-# ── Gate 3b: disabled in v5 (rank_birdnet = None) ────────────────────────────
-# Re-enable by setting rank_birdnet above and tuning threshold/weight.
+# ── Gate 3b: disabled (Case 2 handles BirdNET via no-signal blend above) ──────
 
 sub = df_proto.copy()
 sub[cols] = pred.astype(np.float32)
