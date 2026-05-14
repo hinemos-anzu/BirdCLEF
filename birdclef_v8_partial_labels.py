@@ -549,16 +549,30 @@ def build_class_freq_weights(Y, cap=10.0):
     weights = np.clip(1.0 / (freq ** 0.5), 1.0, cap)
     return (weights / weights.mean()).astype(np.float32)
 
-def build_sequential_features(scores_col, n_windows=12):
-    x     = scores_col.reshape(-1, n_windows)
-    prev  = np.concatenate([x[:, :1], x[:, :-1]], axis=1)
-    next_ = np.concatenate([x[:, 1:], x[:, -1:]], axis=1)
-    mean  = np.repeat(x.mean(axis=1), n_windows)
-    max_  = np.repeat(x.max(axis=1),  n_windows)
-    std   = np.repeat(x.std(axis=1),  n_windows)
-    return prev.reshape(-1), next_.reshape(-1), mean, max_, std
+def build_sequential_features(scores_col, n_windows=12, file_sizes=None):
+    if file_sizes is None:
+        x     = scores_col.reshape(-1, n_windows)
+        prev  = np.concatenate([x[:, :1], x[:, :-1]], axis=1)
+        next_ = np.concatenate([x[:, 1:], x[:, -1:]], axis=1)
+        mean  = np.repeat(x.mean(axis=1), n_windows)
+        max_  = np.repeat(x.max(axis=1),  n_windows)
+        std   = np.repeat(x.std(axis=1),  n_windows)
+        return prev.reshape(-1), next_.reshape(-1), mean, max_, std
+    # Variable-length files: compute per-file sequential context
+    prev_l, next_l, mean_l, max_l, std_l = [], [], [], [], []
+    offset = 0
+    for sz in file_sizes:
+        x = scores_col[offset:offset + sz]
+        prev_l.append(np.concatenate([[x[0]], x[:-1]]))
+        next_l.append(np.concatenate([x[1:], [x[-1]]]))
+        mean_l.append(np.full(sz, x.mean()))
+        max_l.append(np.full(sz, x.max()))
+        std_l.append(np.full(sz, x.std() if sz > 1 else 0.0))
+        offset += sz
+    return (np.concatenate(prev_l), np.concatenate(next_l),
+            np.concatenate(mean_l), np.concatenate(max_l), np.concatenate(std_l))
 
-def train_mlp_probes(emb, scores_raw, Y, min_pos=5, pca_dim=64, alpha_blend=0.4):
+def train_mlp_probes(emb, scores_raw, Y, min_pos=5, pca_dim=64, alpha_blend=0.4, file_sizes=None):
     scaler = StandardScaler(); emb_s = scaler.fit_transform(emb)
     pca    = PCA(n_components=min(pca_dim, emb_s.shape[1] - 1))
     Z      = pca.fit_transform(emb_s).astype(np.float32)
@@ -568,7 +582,7 @@ def train_mlp_probes(emb, scores_raw, Y, min_pos=5, pca_dim=64, alpha_blend=0.4)
     for ci in tqdm(active, desc="MLP probes"):
         y = Y[:, ci]
         if y.sum() == 0 or y.sum() == len(y): continue
-        prev, next_, mean, max_, std = build_sequential_features(scores_raw[:, ci])
+        prev, next_, mean, max_, std = build_sequential_features(scores_raw[:, ci], file_sizes=file_sizes)
         X = np.hstack([Z, scores_raw[:, ci:ci+1], prev[:, None], next_[:, None], mean[:, None], max_[:, None], std[:, None]])
         n_pos = int(y.sum()); n_neg = len(y) - n_pos; pos_idx = np.where(y == 1)[0]
         w = float(class_weights[ci]); repeat = max(1, min(int(round(w * n_neg / max(n_pos, 1))), 8))
@@ -863,8 +877,10 @@ prior_tables   = build_prior_tables(sc, Y_SC)
 sc_te_adjusted = apply_prior(sc_te, sites=meta_te["site"].to_numpy(),
                               hours=meta_te["hour_utc"].to_numpy(), tables=prior_tables, lambda_prior=0.4)
 
+_aug_file_sizes = meta_tr_aug.groupby("filename", sort=False).size().tolist()
 probe_models, emb_scaler, emb_pca, alpha_blend = train_mlp_probes(
-    emb=emb_tr_aug, scores_raw=sc_tr_aug, Y=Y_aug_aligned, min_pos=5, pca_dim=64, alpha_blend=0.4)
+    emb=emb_tr_aug, scores_raw=sc_tr_aug, Y=Y_aug_aligned,
+    min_pos=5, pca_dim=64, alpha_blend=0.4, file_sizes=_aug_file_sizes)
 sc_te_adjusted = apply_mlp_probes_vectorized(emb_te, sc_te_adjusted, probe_models, emb_scaler, emb_pca, alpha_blend)
 
 ENSEMBLE_W      = 0.5
