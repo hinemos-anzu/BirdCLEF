@@ -1,12 +1,9 @@
-# BirdCLEF+ 2026 — v6: 0.947 Base + BirdNET Case 2 (no-signal species only)
+# BirdCLEF+ 2026 — v7: 0.947 Base + Test TTA + BirdNET Case 2
 #
-# Strategy:
-#   Base blend is always 60/40 (ProtoSSM/SED) for the 206 species where Perch
-#   has a direct logit or genus proxy — identical to the original 0.947.
-#
-#   For the 28 species where Perch has ZERO signal (unmapped AND no proxy),
-#   ProtoSSM lacks any Perch logit, so BirdNET adds genuine new information.
-#   Those 28 species use a 30/40/30 Proto/SED/BirdNET blend instead.
+# Changes from v6:
+#   Test inference now uses the same 5-shift TTA as training calibration.
+#   run_tta_proto(shifts=[0,1,-1,2,-2]) replaces the single-pass forward call.
+#   BirdNET Case 2 (30/40/30 blend for 28 no-signal species) is retained.
 #
 # Attribution: Vyanktesh Dwivedi (base), Imaad Mahmood (ProtoSSM 0.946),
 #              Tucker Arrants (SED), Stefan Kahl et al. (BirdNET),
@@ -821,15 +818,15 @@ test_site_ids = np.array([min(site2i_tr.get(meta_te.loc[meta_te["filename"]==fn,
 test_hour_ids = np.array([int(meta_te.loc[meta_te["filename"]==fn,"hour_utc"].iloc[0])%24
                            for fn in test_fnames], dtype=np.int64)
 
-proto_model.eval()
-with torch.no_grad():
-    proto_out = proto_model(
-        torch.tensor(emb_te_f, dtype=torch.float32),
-        torch.tensor(sc_te_f,  dtype=torch.float32),
-        site_ids=torch.tensor(test_site_ids, dtype=torch.long),
-        hours   =torch.tensor(test_hour_ids, dtype=torch.long),
-    ).numpy()
+# TTA on test data: 5-shift temporal average (same as training calibration)
+proto_out = run_tta_proto(
+    proto_model, emb_te_f, sc_te_f,
+    site_t=torch.tensor(test_site_ids, dtype=torch.long),
+    hour_t=torch.tensor(test_hour_ids, dtype=torch.long),
+    shifts=[0, 1, -1, 2, -2],
+)
 proto_scores_flat = proto_out.reshape(-1, N_CLASSES).astype(np.float32)
+print("Test TTA applied (5 shifts)")
 
 prior_tables   = build_prior_tables(sc, Y_SC)
 sc_te_adjusted = apply_prior(sc_te, sites=meta_te["site"].to_numpy(),
