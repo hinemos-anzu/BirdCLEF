@@ -1181,21 +1181,9 @@ p_sed   = np.clip(df_sed[cols].to_numpy(np.float32),   EPS, 1.0 - EPS)
 rank_proto = pd.DataFrame(p_proto).rank(axis=0, pct=True).to_numpy(np.float32)
 rank_sed   = pd.DataFrame(p_sed).rank(axis=0, pct=True).to_numpy(np.float32)
 
-# ── Load BirdNET (supplement only — base blend is always 60/40) ───────────────
-try:
-    df_birdnet = pd.read_csv("submission_birdnet.csv")
-    df_birdnet = df_birdnet.set_index("row_id").loc[df_proto["row_id"]].reset_index()
-    p_birdnet  = np.clip(df_birdnet[cols].to_numpy(np.float32), EPS, 1.0 - EPS)
-    _bn_active = (p_birdnet > 0.01).any()
-    if _bn_active:
-        rank_birdnet = pd.DataFrame(p_birdnet).rank(axis=0, pct=True).to_numpy(np.float32)
-        print("BirdNET loaded — Gate 3b supplement only (base blend unchanged)")
-    else:
-        rank_birdnet = None
-        print("BirdNET scores all zero — Gate 3b inactive")
-except Exception as _e:
-    rank_birdnet = None
-    print(f"BirdNET load failed ({_e}) — Gate 3b inactive")
+# ── BirdNET loaded for future use but Gate 3b disabled to match 0.947 exactly ─
+rank_birdnet = None  # Gate 3b disabled: BirdNET scores not used in blend
+print("BirdNET blend disabled — Gate 3b inactive (matching original 0.947)")
 
 # ── Base blend: always 60/40 (original 0.947 setting) ─────────────────────────
 print("Executing standard 2-way rank blend (60% Proto / 40% SED)...")
@@ -1231,12 +1219,8 @@ pred = np.where(proto_cont,
 sed_only = (rank_sed > 0.95) & (rank_proto < 0.80) & (~fake_only) & (~proto_cont)
 pred = np.where(sed_only, (1.0 - 0.12) * pred + 0.12 * rank_sed, pred)
 
-# ── Gate 3b: BirdNET spike preservation (conservative — supplement only) ──────
-# Threshold raised to 0.97 and weight reduced to 0.05 vs v4.
-# Activates only when BirdNET is extremely confident and both other models are low.
-if rank_birdnet is not None:
-    bn_only = (rank_birdnet > 0.97) & (rank_proto < 0.75) & (rank_sed < 0.80) & (~fake_only) & (~proto_cont) & (~sed_only)
-    pred = np.where(bn_only, (1.0 - 0.05) * pred + 0.05 * rank_birdnet, pred)
+# ── Gate 3b: disabled in v5 (rank_birdnet = None) ────────────────────────────
+# Re-enable by setting rank_birdnet above and tuning threshold/weight.
 
 sub = df_proto.copy()
 sub[cols] = pred.astype(np.float32)
